@@ -1,7 +1,22 @@
 """
 Leadgen BigQuery Upload Pipeline
-Runs all 5 steps in sequence. No checkpointing needed — GitHub Actions
-gives us a 6-hour window, so the full ~20 min job runs in one shot.
+
+Supports three run modes controlled by environment variables:
+
+  MODE=production   (default)
+    - Target date  = yesterday (auto)
+    - Table        = BQ_TABLE env var (main table)
+
+  MODE=test_auto
+    - Target date  = yesterday (auto)
+    - Table        = BQ_TABLE_BACKUP env var (backup table)
+
+  MODE=test_manual
+    - Target date  = TEST_DATE env var  e.g. "2026-06-01"  (YYYY-MM-DD)
+    - Table        = BQ_TABLE_BACKUP env var (backup table)
+
+In all modes, secrets come from environment variables (GitHub Secrets).
+Zero dependency on Google Sheets.
 """
 
 import os
@@ -23,12 +38,17 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Config (all sensitive values come from GitHub Secrets → env vars) ───────
-ACCESS_TOKEN  = os.environ["TRACXN_ACCESS_TOKEN"]
-PROJECT_ID    = os.environ["GCP_PROJECT_ID"]
-DATASET       = os.environ.get("BQ_DATASET", "leadgen_dataset")
-TABLE         = os.environ.get("BQ_TABLE",   "leadgen_users_v2_no_partition")
-GCP_SA_JSON   = os.environ["GCP_SA_KEY"]       # full service-account JSON string
+# ── Secrets / config from environment ──────────────────────────────────────
+ACCESS_TOKEN = os.environ["TRACXN_ACCESS_TOKEN"]
+PROJECT_ID   = os.environ["GCP_PROJECT_ID"]
+DATASET      = os.environ.get("BQ_DATASET", "leadgen_dataset")
+GCP_SA_JSON  = os.environ["GCP_SA_KEY"]
+
+# Run-mode config
+MODE              = os.environ.get("MODE", "production").lower()
+TABLE_PRODUCTION  = os.environ.get("BQ_TABLE",        "leadgen_users_v2_no_partition")
+TABLE_BACKUP      = os.environ.get("BQ_TABLE_BACKUP",  "leadgen_users_v2_no_partition_backup3")
+TEST_DATE_INPUT   = os.environ.get("TEST_DATE", "")    # YYYY-MM-DD, only used in test_manual
 
 HEADERS = {
     "accessToken": ACCESS_TOKEN,
@@ -48,9 +68,9 @@ FORM_TYPES = {
     "THIRD_PARTY_SIGNUP_MICROSOFT", "THIRD_PARTY_SIGNUP_ENTRA_ID",
 }
 
-SLEEP_S       = 0.3   # between API pages
-BATCH_SIZE    = 30    # records per API page
-MAX_RETRIES   = 3
+SLEEP_S    = 0.3
+BATCH_SIZE = 30
+MAX_RETRIES = 3
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -58,37 +78,55 @@ MAX_RETRIES   = 3
 # ════════════════════════════════════════════════════════════════════════════
 def main():
     log.info("=" * 60)
-    log.info("LEADGEN PIPELINE STARTED")
+    log.info(f"LEADGEN PIPELINE  |  mode={MODE.upper()}")
     log.info("=" * 60)
 
-    # Date setup: target = yesterday, log window = day-before-yesterday → today
-    today         = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday     = today - timedelta(days=1)
-    two_days_ago  = today - timedelta(days=2)
+    # ── Resolve target date and table based on mode ──────────────────────
+    if MODE == "test_manual":
+        if not TEST_DATE_INPUT:
+            raise ValueError("MODE=test_manual requires TEST_DATE env var (YYYY-MM-DD)")
+        target_dt = datetime.strptime(TEST_DATE_INPUT, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        table = TABLE_BACKUP
+        log.info(f"TEST MODE (manual date) — writing to BACKUP table")
 
-    target_date   = yesterday.strftime("%d/%m/%Y")         # for User API  e.g. 03/06/2026
-    bq_date       = yesterday.strftime("%Y-%m-%d")          # for BigQuery  e.g. 2026-06-03
+    elif MODE == "test_auto":
+        target_dt = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        table = TABLE_BACKUP
+        log.info(f"TEST MODE (yesterday auto) — writing to BACKUP table")
 
-    log.info(f"Target date : {target_date}")
-    log.info(f"Log window  : {two_days_ago.date()} → {today.date()}")
+    else:  # production
+        target_dt = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        table = TABLE_PRODUCTION
+        log.info(f"PRODUCTION MODE — writing to MAIN table")
 
-    # Step 1 & 2: fetch logs
-    platform_map = step1_fetch_platform_logs(two_days_ago, today)
-    form_map     = step2_fetch_form_logs(two_days_ago, today)
+    # Log window: day-before-target → day-after-target (covers timezone edge cases)
+    log_start = target_dt - timedelta(days=1)
+    log_end   = target_dt + timedelta(days=1)
 
-    # Step 3: fetch users
-    users = step3_fetch_users(target_date)
+    target_date_api = target_dt.strftime("%d/%m/%Y")   # DD/MM/YYYY  — for Tracxn User API
+    target_date_bq  = target_dt.strftime("%Y-%m-%d")   # YYYY-MM-DD  — for BigQuery
+
+    log.info(f"Target date : {target_date_api}  ({target_date_bq})")
+    log.info(f"Log window  : {log_start.date()} → {log_end.date()}")
+    log.info(f"Destination : {PROJECT_ID}.{DATASET}.{table}")
+    log.info("-" * 60)
+
+    # ── Run pipeline ──────────────────────────────────────────────────────
+    platform_map = step1_fetch_platform_logs(log_start, log_end)
+    form_map     = step2_fetch_form_logs(log_start, log_end)
+    users        = step3_fetch_users(target_date_api)
+
     log.info(f"Fetched {len(users)} users")
 
-    # Step 4: enrich users
-    records = step4_enrich_users(users, form_map, platform_map, target_date)
+    records = step4_enrich_users(users, form_map, platform_map, target_date_api)
     log.info(f"Enriched {len(records)} records")
 
-    # Step 5: upload
-    step5_upload_to_bigquery(records, bq_date)
+    step5_upload_to_bigquery(records, table)
 
     log.info("=" * 60)
-    log.info(f"PIPELINE COMPLETE for {target_date}")
+    log.info(f"PIPELINE COMPLETE  |  {target_date_api}  →  {table}")
     log.info("=" * 60)
 
 
@@ -96,9 +134,7 @@ def main():
 # STEP 1 — Platform Logs
 # ════════════════════════════════════════════════════════════════════════════
 def step1_fetch_platform_logs(start: datetime, end: datetime) -> dict:
-    """Returns {email: [{"sessionId": ..., "ts": ...}]}"""
     log.info("STEP 1: Fetching platform logs...")
-
     payload = {
         "filter": {
             "createdDate": {
@@ -107,7 +143,6 @@ def step1_fetch_platform_logs(start: datetime, end: datetime) -> dict:
             }
         }
     }
-
     records = fetch_all(API["platform"], payload, "platform_logs")
     log.info(f"  → {len(records)} platform log entries")
 
@@ -116,10 +151,8 @@ def step1_fetch_platform_logs(start: datetime, end: datetime) -> dict:
         email = (r.get("requestor", {}).get("userEmail") or "").lower()
         sid   = r.get("requestor", {}).get("sessionId") or ""
         ts    = r.get("createdDate", {}).get("epochMillis", 0)
-        if not email:
-            continue
-        result.setdefault(email, []).append({"sessionId": sid, "ts": ts})
-
+        if email:
+            result.setdefault(email, []).append({"sessionId": sid, "ts": ts})
     return result
 
 
@@ -127,7 +160,6 @@ def step1_fetch_platform_logs(start: datetime, end: datetime) -> dict:
 # STEP 2 — Form Logs
 # ════════════════════════════════════════════════════════════════════════════
 def step2_fetch_form_logs(start: datetime, end: datetime) -> dict:
-    """Returns {email: [{"sessionId": ..., "ts": ..., "path": ...}]}"""
     log.info("STEP 2: Fetching form logs...")
 
     def fmt(dt: datetime, end_of_day: bool) -> str:
@@ -136,13 +168,9 @@ def step2_fetch_form_logs(start: datetime, end: datetime) -> dict:
 
     payload = {
         "filter": {
-            "createdDate": {
-                "min": fmt(start, False),
-                "max": fmt(end, True),
-            }
+            "createdDate": {"min": fmt(start, False), "max": fmt(end, True)}
         }
     }
-
     records = fetch_all(API["form"], payload, "form_logs")
     log.info(f"  → {len(records)} form log entries")
 
@@ -152,10 +180,8 @@ def step2_fetch_form_logs(start: datetime, end: datetime) -> dict:
         sid   = r.get("sessionId") or ""
         ts    = r.get("createdDate", {}).get("epochMillis", 0)
         path  = r.get("metrics", {}).get("page", {}).get("parsedUrl", {}).get("pathname") or ""
-        if not email:
-            continue
-        result.setdefault(email, []).append({"sessionId": sid, "ts": ts, "path": path})
-
+        if email:
+            result.setdefault(email, []).append({"sessionId": sid, "ts": ts, "path": path})
     return result
 
 
@@ -163,15 +189,8 @@ def step2_fetch_form_logs(start: datetime, end: datetime) -> dict:
 # STEP 3 — Fetch Users
 # ════════════════════════════════════════════════════════════════════════════
 def step3_fetch_users(target_date: str) -> list:
-    """target_date: DD/MM/YYYY"""
     log.info(f"STEP 3: Fetching users for {target_date}...")
-
-    payload = {
-        "filter": {
-            "createdDate": {"min": target_date, "max": target_date}
-        }
-    }
-
+    payload = {"filter": {"createdDate": {"min": target_date, "max": target_date}}}
     users = fetch_all(API["user"], payload, "users")
     log.info(f"  → {len(users)} users fetched")
     return users
@@ -180,43 +199,30 @@ def step3_fetch_users(target_date: str) -> list:
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 4 — Enrich Users
 # ════════════════════════════════════════════════════════════════════════════
-def step4_enrich_users(users: list, form_map: dict, platform_map: dict, target_date: str) -> list:
+def step4_enrich_users(users, form_map, platform_map, target_date) -> list:
     log.info(f"STEP 4: Enriching {len(users)} users...")
     records = []
-
     for i, user in enumerate(users, 1):
         if i % 50 == 0:
             log.info(f"  Processed {i}/{len(users)}...")
-
-        record = build_user_record(user, form_map, platform_map, target_date)
-        records.append(record)
-
-    log.info(f"  → {len(records)} records ready for upload")
+        records.append(build_user_record(user, form_map, platform_map, target_date))
+    log.info(f"  → {len(records)} records ready")
     return records
 
 
-def build_user_record(user: dict, form_map: dict, platform_map: dict, target_date: str) -> dict:
+def build_user_record(user, form_map, platform_map, target_date) -> dict:
     email    = (user.get("email") or "").lower()
     reg_type = user.get("registrationType") or ""
 
-    # Category
-    category_list = user.get("categoryList") or []
-    cats = [c.get("userCategory") for c in category_list if c.get("userCategory")]
+    cats = [c.get("userCategory") for c in (user.get("categoryList") or []) if c.get("userCategory")]
     user_category = ", ".join(cats) if cats else (user.get("userCategory") or "N/A")
 
-    # Created date → YYYY-MM-DD
     cd = user.get("createdDate") or {}
-    created_date = "{}-{:02d}-{:02d}".format(
-        cd.get("year", 2025), cd.get("month", 1), cd.get("day", 1)
-    )
+    created_date = "{}-{:02d}-{:02d}".format(cd.get("year", 2025), cd.get("month", 1), cd.get("day", 1))
 
-    # Session ID
     session_id = None
     if reg_type in FORM_TYPES:
-        entries = sorted(
-            [e for e in form_map.get(email, []) if e["path"] == "/signup"],
-            key=lambda x: x["ts"]
-        )
+        entries = sorted([e for e in form_map.get(email, []) if e["path"] == "/signup"], key=lambda x: x["ts"])
         if entries:
             session_id = entries[0]["sessionId"]
     else:
@@ -224,37 +230,26 @@ def build_user_record(user: dict, form_map: dict, platform_map: dict, target_dat
         if entries:
             session_id = entries[0]["sessionId"]
 
-    # Journey
     origin = trigger = journey = "N/A"
-
     if session_id:
         url_logs = fetch_limited(API["urlchange"], {"filter": {"sessionId": session_id}}, 50)
         events = sorted(
-            [
-                {
-                    "ts":      e.get("createdDate", {}).get("epochMillis", 0),
-                    "url":     e.get("metrics", {}).get("page", {}).get("url") or "",
-                    "path":    e.get("metrics", {}).get("page", {}).get("parsedUrl", {}).get("pathname") or "",
-                    "tab":     e.get("tabId"),
-                    "prevTab": e.get("previousTabId"),
-                }
-                for e in url_logs
-                if e.get("metrics", {}).get("page", {}).get("url")
-            ],
+            [{"ts": e.get("createdDate", {}).get("epochMillis", 0),
+              "url": e.get("metrics", {}).get("page", {}).get("url") or "",
+              "path": e.get("metrics", {}).get("page", {}).get("parsedUrl", {}).get("pathname") or "",
+              "tab": e.get("tabId"), "prevTab": e.get("previousTabId")}
+             for e in url_logs if e.get("metrics", {}).get("page", {}).get("url")],
             key=lambda x: x["ts"]
         )
-
         if events:
             origin  = events[0]["url"]
             journey = " > ".join(e["url"].split("?")[0] for e in events)
-
             auth_events = [e for e in events if e["path"] in ("/signup", "/login")]
             if auth_events:
                 tab = auth_events[-1]["prevTab"]
                 while tab:
                     prev = next((e for e in events if e["tab"] == tab), None)
-                    if not prev:
-                        break
+                    if not prev: break
                     if prev["path"] not in ("/signup", "/login"):
                         trigger = prev["url"]
                         break
@@ -265,34 +260,32 @@ def build_user_record(user: dict, form_map: dict, platform_map: dict, target_dat
                 trigger = origin
 
     return {
-        "createdDate":    created_date,
-        "id":             str(user.get("id") or ""),
-        "email":          email,
-        "userCategory":   clean(user_category),
-        "originUrl":      clean(origin),
-        "triggerUrl":     clean(trigger),
-        "geography":      clean(user.get("primaryGeography") or "N/A"),
+        "createdDate":      created_date,
+        "id":               str(user.get("id") or ""),
+        "email":            email,
+        "userCategory":     clean(user_category),
+        "originUrl":        clean(origin),
+        "triggerUrl":       clean(trigger),
+        "geography":        clean(user.get("primaryGeography") or "N/A"),
         "registrationType": clean(reg_type),
-        "sessionId":      clean(session_id or "N/A"),
-        "userJourney":    clean(journey, is_journey=True),
-        "cta":            f"Auto_{target_date}",
+        "sessionId":        clean(session_id or "N/A"),
+        "userJourney":      clean(journey, is_journey=True),
+        "cta":              f"Auto_{target_date}",
     }
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 5 — Upload to BigQuery
 # ════════════════════════════════════════════════════════════════════════════
-def step5_upload_to_bigquery(records: list, bq_date: str):
-    log.info(f"STEP 5: Uploading {len(records)} rows to BigQuery ({TABLE})...")
+def step5_upload_to_bigquery(records: list, table: str):
+    log.info(f"STEP 5: Uploading {len(records)} rows → {PROJECT_ID}.{DATASET}.{table}")
 
-    sa_info = json.loads(GCP_SA_JSON)
-    creds   = service_account.Credentials.from_service_account_info(
-        sa_info,
+    creds  = service_account.Credentials.from_service_account_info(
+        json.loads(GCP_SA_JSON),
         scopes=["https://www.googleapis.com/auth/cloud-platform"]
     )
-    client = bigquery.Client(project=PROJECT_ID, credentials=creds)
-
-    table_ref = f"{PROJECT_ID}.{DATASET}.{TABLE}"
+    client    = bigquery.Client(project=PROJECT_ID, credentials=creds)
+    table_ref = f"{PROJECT_ID}.{DATASET}.{table}"
 
     schema = [
         bigquery.SchemaField("createdDate",       "DATE",   mode="NULLABLE"),
@@ -314,73 +307,51 @@ def step5_upload_to_bigquery(records: list, bq_date: str):
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
     )
 
-    # Use newline-delimited JSON — much safer than CSV (no escaping headaches)
-    rows_json = "\n".join(json.dumps(r) for r in records)
-
-    job = client.load_table_from_json(
-        [json.loads(r) for r in rows_json.splitlines()],
-        table_ref,
-        job_config=job_config,
-    )
-    job.result()  # Waits for completion, raises on error
-
+    job = client.load_table_from_json(records, table_ref, job_config=job_config)
+    job.result()
     log.info(f"  ✓ {len(records)} rows uploaded successfully")
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # SHARED HELPERS
 # ════════════════════════════════════════════════════════════════════════════
-def fetch_all(endpoint: str, payload: dict, name: str) -> list:
-    """Paginate through all records from a Tracxn API endpoint."""
+def fetch_all(endpoint, payload, name) -> list:
     results = []
     payload = {**payload, "size": BATCH_SIZE, "from": 0}
-
-    log.info(f"  [{name}] Starting fetch — payload: {json.dumps(payload)}")
-
+    log.info(f"  [{name}] payload: {json.dumps(payload)}")
     while True:
         batch, ok = _post(endpoint, payload, name)
         if not ok or not batch:
             break
-
         results.extend(batch)
         payload["from"] += len(batch)
-
         if len(results) % 150 == 0:
             log.info(f"  [{name}] {len(results)} records so far...")
-
         time.sleep(SLEEP_S)
-
     return results
 
 
-def fetch_limited(endpoint: str, payload: dict, max_records: int) -> list:
-    """Fetch up to max_records — used for per-user URL changes."""
+def fetch_limited(endpoint, payload, max_records) -> list:
     payload = {**payload, "size": min(BATCH_SIZE, max_records), "from": 0}
     batch, _ = _post(endpoint, payload, "urlchange")
     return (batch or [])[:max_records]
 
 
-def _post(endpoint: str, payload: dict, name: str):
-    """Single POST with retry. Returns (records_list, success_bool)."""
+def _post(endpoint, payload, name):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.post(endpoint, headers=HEADERS, json=payload, timeout=30)
-
             if resp.status_code != 200:
                 log.warning(f"  [{name}] HTTP {resp.status_code} (attempt {attempt}): {resp.text[:200]}")
                 if attempt < MAX_RETRIES:
                     time.sleep(3 * attempt)
                     continue
                 return [], False
-
-            data = resp.json()
-            return data.get("result") or [], True
-
+            return resp.json().get("result") or [], True
         except requests.RequestException as e:
             log.warning(f"  [{name}] Request error (attempt {attempt}): {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(5 * attempt)
-
     return [], False
 
 
