@@ -1,72 +1,114 @@
+# ================================================================================
+# Leadgen BigQuery Pipeline — GitHub Actions Workflow
+# ================================================================================
+#
+# SCHEDULE
+#   Runs automatically every day at 6:00 AM IST (= 00:30 UTC).
+#   GitHub Actions cron always uses UTC, so IST (UTC+5:30) requires subtracting
+#   5h30m. 6:00 AM IST = 12:30 AM UTC previous calendar day → cron: "30 0 * * *"
+#
+# MANUAL RUNS
+#   Go to: Actions tab → Leadgen BigQuery Pipeline → Run workflow
+#   Select a mode and (optionally) enter a date.
+#
+# MODES
+#   production           Auto yesterday → Main table   (used by schedule)
+#   production_manual    Your date      → Main table   (backfill / rerun)
+#   test_auto            Auto yesterday → Backup table (safe smoke test)
+#   test_manual          Your date      → Backup table (safe historical test)
+#
+# SECRETS REQUIRED (Settings → Secrets → Actions)
+#   TRACXN_ACCESS_TOKEN   Tracxn API access token
+#   GCP_PROJECT_ID        GCP project ID (e.g. leadgen-474708)
+#   GCP_SA_KEY            Full JSON content of GCP service account key file
+#
+# VARIABLES REQUIRED (Settings → Secrets → Actions → Variables tab)
+#   BQ_DATASET            BigQuery dataset (e.g. leadgen_dataset)
+#   BQ_TABLE              Main table name
+#   BQ_TABLE_BACKUP       Backup table name (used for test modes)
+# ================================================================================
+
 name: Leadgen BigQuery Pipeline
 
 on:
-  # ── Production schedule: 6:00 AM IST = 00:30 UTC ──────────────────────
+  # ── Automatic daily schedule: 6:00 AM IST = 00:30 UTC ───────────────────────
   schedule:
     - cron: "30 0 * * *"
 
-  # ── Manual trigger with inputs — for testing ──────────────────────────
+  # ── Manual trigger with mode + optional date input ───────────────────────────
   workflow_dispatch:
     inputs:
       mode:
-        description: "Run mode"
+        description: "Run mode — choose what to run and where to write"
         required: true
         default: "test_auto"
         type: choice
         options:
-          - test_auto       # yesterday's date → backup table
-          - test_manual     # specific date you type → backup table
-          - production      # yesterday's date → main table
+          - test_auto            # Safe: yesterday → backup table
+          - test_manual          # Safe: your date  → backup table
+          - production_manual    # Live: your date  → MAIN table (backfill)
+          - production           # Live: yesterday  → MAIN table
       test_date:
-        description: "Date to process (YYYY-MM-DD). Only used when mode=test_manual."
+        description: "Date to process in YYYY-MM-DD format. Required for *_manual modes."
         required: false
         default: ""
 
 jobs:
   run-pipeline:
-    name: Run Pipeline (${{ github.event.inputs.mode || 'production' }})
+    name: "Pipeline [${{ github.event.inputs.mode || 'production (scheduled)' }}]"
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 60    # Hard cap — pipeline takes ~20 min; 60 gives 3x headroom
 
     steps:
+      # ── 1. Check out repository code ──────────────────────────────────────────
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # ── 2. Set up Python ───────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: "pip"           # Caches pip dependencies between runs for speed
 
+      # ── 3. Install Python dependencies ────────────────────────────────────────
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # ── 4. Run the pipeline ───────────────────────────────────────────────────
+      #
+      # Secrets are passed as environment variables at runtime.
+      # They are masked in all logs — you will see *** if they appear.
+      # The MODE defaults to 'production' when triggered by the schedule
+      # (schedule events have no inputs, so github.event.inputs.mode is empty).
       - name: Run pipeline
         env:
-          # ── Secrets (sensitive) ───────────────────────────────────────
+          # Secrets
           TRACXN_ACCESS_TOKEN: ${{ secrets.TRACXN_ACCESS_TOKEN }}
           GCP_PROJECT_ID:      ${{ secrets.GCP_PROJECT_ID }}
           GCP_SA_KEY:          ${{ secrets.GCP_SA_KEY }}
-
-          # ── Non-sensitive config vars ─────────────────────────────────
+          # Config variables
           BQ_DATASET:          ${{ vars.BQ_DATASET }}
           BQ_TABLE:            ${{ vars.BQ_TABLE }}
           BQ_TABLE_BACKUP:     ${{ vars.BQ_TABLE_BACKUP }}
-
-          # ── Mode: scheduled runs always use 'production'
-          #         manual trigger uses whatever was selected ─────────────
-          MODE:      ${{ github.event.inputs.mode || 'production' }}
-          TEST_DATE: ${{ github.event.inputs.test_date || '' }}
-
+          # Mode — empty string from schedule → pipeline defaults to 'production'
+          MODE:                ${{ github.event.inputs.mode || 'production' }}
+          TEST_DATE:           ${{ github.event.inputs.test_date || '' }}
         run: python pipeline.py
 
-      - name: Print summary
+      # ── 5. Write a summary to the Actions run page ────────────────────────────
+      #
+      # This adds a summary table visible at the bottom of each Actions run page.
+      # 'if: always()' ensures it runs even if the pipeline step failed.
+      - name: Write run summary
         if: always()
         run: |
           echo "### Pipeline Run Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Mode | ${{ github.event.inputs.mode || 'production' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Test Date Input | ${{ github.event.inputs.test_date || 'N/A (auto)' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Triggered By | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Status | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Mode** | \`${{ github.event.inputs.mode || 'production (scheduled)' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Date input** | ${{ github.event.inputs.test_date || 'N/A — auto (yesterday)' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered by** | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Runner** | ${{ runner.os }} |" >> $GITHUB_STEP_SUMMARY
