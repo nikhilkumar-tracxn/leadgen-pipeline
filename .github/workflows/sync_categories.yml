@@ -1,0 +1,162 @@
+# ================================================================================
+# Category Sync Workflow
+# ================================================================================
+#
+# PURPOSE
+#   Re-fetches the latest user categories from the Tracxn API for users already
+#   in BigQuery and updates the userCategory column in place.
+#
+# AUTOMATIC SCHEDULES
+#
+#   Weekly sync  — 7th, 14th, 21st, 28th of every month at 7:00 AM IST (01:30 UTC)
+#                  Updates users created in the last 7 days
+#
+#   Monthly sync — 1st of every month at 7:30 AM IST (02:00 UTC)
+#                  Updates all users from the previous full calendar month
+#
+#   Why different times from the daily pipeline (6 AM)?
+#   The daily pipeline runs at 6 AM IST and takes ~20 minutes. The sync
+#   jobs are scheduled at 7 AM / 7:30 AM to avoid any overlap.
+#
+# MANUAL TRIGGER
+#   Go to: Actions → Category Sync → Run workflow
+#   Select a mode and optionally enter a custom date range.
+#
+# MODES
+#   weekly_auto        Last 7 days (auto)      → Main table
+#   monthly_auto       Last full month (auto)  → Main table
+#   manual             Custom date range       → Main table
+#   test_weekly_auto   Last 7 days (auto)      → Backup table
+#   test_monthly_auto  Last full month (auto)  → Backup table
+#   test_manual        Custom date range       → Backup table
+#
+# SECRETS REQUIRED (same as pipeline.yml — already set up)
+#   TRACXN_ACCESS_TOKEN, GCP_PROJECT_ID, GCP_SA_KEY
+#
+# VARIABLES REQUIRED (same as pipeline.yml — already set up)
+#   BQ_DATASET, BQ_TABLE, BQ_TABLE_BACKUP
+# ================================================================================
+
+name: Category Sync
+
+on:
+  # ── Weekly sync: 7th, 14th, 21st, 28th at 7:00 AM IST (01:30 UTC) ──────────
+  # GitHub cron does not support day-of-month lists, so we use a workaround:
+  # run every day at 01:30 UTC but only execute on the target days.
+  # The job itself exits immediately if today is not 7/14/21/28.
+  # See the "Check if today is a weekly sync day" step below.
+  schedule:
+    - cron: "30 1 * * *"    # Runs daily — script guards which days actually proceed
+
+  # ── Monthly sync: 1st of every month at 7:30 AM IST (02:00 UTC) ─────────────
+  # We use a second schedule entry for the 1st.
+    - cron: "0 2 1 * *"
+
+  # ── Manual trigger ────────────────────────────────────────────────────────────
+  workflow_dispatch:
+    inputs:
+      sync_mode:
+        description: "Sync mode — what date range and which table"
+        required: true
+        default: "test_weekly_auto"
+        type: choice
+        options:
+          - test_weekly_auto     # Safe: last 7 days → backup table
+          - test_monthly_auto    # Safe: last full month → backup table
+          - test_manual          # Safe: your date range → backup table
+          - weekly_auto          # Live: last 7 days → MAIN table
+          - monthly_auto         # Live: last full month → MAIN table
+          - manual               # Live: your date range → MAIN table
+      sync_start_date:
+        description: "Start date YYYY-MM-DD. Required only for *manual modes."
+        required: false
+        default: ""
+      sync_end_date:
+        description: "End date YYYY-MM-DD. Required only for *manual modes."
+        required: false
+        default: ""
+
+jobs:
+  sync-categories:
+    name: "Category Sync [${{ github.event.inputs.sync_mode || 'scheduled' }}]"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120    # Monthly sync on large datasets can take up to ~1h
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── Determine which mode to run ─────────────────────────────────────────
+      # For scheduled triggers:
+      #   - The daily cron (30 1 * * *) only proceeds on days 7,14,21,28
+      #     as weekly_auto. On other days it exits cleanly with a skip message.
+      #   - The monthly cron (0 2 1 * *) always proceeds as monthly_auto.
+      # For manual triggers, SYNC_MODE is passed directly from the input.
+      - name: Determine sync mode for scheduled run
+        id: resolve_mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "SYNC_MODE=${{ github.event.inputs.sync_mode }}" >> $GITHUB_ENV
+            echo "SYNC_START_DATE=${{ github.event.inputs.sync_start_date }}" >> $GITHUB_ENV
+            echo "SYNC_END_DATE=${{ github.event.inputs.sync_end_date }}" >> $GITHUB_ENV
+            echo "SHOULD_RUN=true" >> $GITHUB_ENV
+          else
+            # Scheduled trigger — figure out which schedule fired
+            DAY=$(date -u +%d | sed 's/^0//')   # Day of month, no leading zero
+            HOUR=$(date -u +%H)
+
+            if [ "$HOUR" = "02" ]; then
+              # 02:00 UTC = monthly schedule (1st of month)
+              echo "SYNC_MODE=monthly_auto" >> $GITHUB_ENV
+              echo "SHOULD_RUN=true" >> $GITHUB_ENV
+              echo "Scheduled monthly sync on 1st of month"
+            elif [ "$DAY" = "7" ] || [ "$DAY" = "14" ] || [ "$DAY" = "21" ] || [ "$DAY" = "28" ]; then
+              echo "SYNC_MODE=weekly_auto" >> $GITHUB_ENV
+              echo "SHOULD_RUN=true" >> $GITHUB_ENV
+              echo "Scheduled weekly sync on day $DAY"
+            else
+              echo "SHOULD_RUN=false" >> $GITHUB_ENV
+              echo "Today (day $DAY) is not a weekly sync day — skipping"
+            fi
+          fi
+
+      - name: Run category sync
+        if: env.SHOULD_RUN == 'true'
+        env:
+          TRACXN_ACCESS_TOKEN: ${{ secrets.TRACXN_ACCESS_TOKEN }}
+          GCP_PROJECT_ID:      ${{ secrets.GCP_PROJECT_ID }}
+          GCP_SA_KEY:          ${{ secrets.GCP_SA_KEY }}
+          BQ_DATASET:          ${{ vars.BQ_DATASET }}
+          BQ_TABLE:            ${{ vars.BQ_TABLE }}
+          BQ_TABLE_BACKUP:     ${{ vars.BQ_TABLE_BACKUP }}
+          SYNC_MODE:           ${{ env.SYNC_MODE }}
+          SYNC_START_DATE:     ${{ env.SYNC_START_DATE }}
+          SYNC_END_DATE:       ${{ env.SYNC_END_DATE }}
+        run: python sync_categories.py
+
+      - name: Skip message
+        if: env.SHOULD_RUN == 'false'
+        run: echo "Sync skipped — not a scheduled sync day. No action taken."
+
+      - name: Write run summary
+        if: always()
+        run: |
+          echo "### Category Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Mode** | \`${{ env.SYNC_MODE || 'not set (skipped)' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Start date** | ${{ env.SYNC_START_DATE || 'N/A (auto)' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **End date** | ${{ env.SYNC_END_DATE || 'N/A (auto)' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered by** | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Should run** | ${{ env.SHOULD_RUN }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
