@@ -1,0 +1,54 @@
+name: Leadgen BigQuery Pipeline
+
+on:
+  schedule:
+    # Runs daily at 2:00 AM UTC. Adjust to your timezone:
+    # IST = UTC+5:30, so 2:00 AM IST = 8:30 PM UTC previous day
+    - cron: "30 20 * * *"
+
+  # Allows you to run manually from the GitHub Actions tab
+  workflow_dispatch:
+
+jobs:
+  run-pipeline:
+    name: Run Leadgen Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 60         # Hard cap — your job takes ~20 min
+
+    steps:
+      # 1. Check out your repo
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 4. Run the pipeline
+      #    Secrets are passed in as environment variables.
+      #    They are never printed in logs.
+      - name: Run pipeline
+        env:
+          TRACXN_ACCESS_TOKEN: ${{ secrets.TRACXN_ACCESS_TOKEN }}
+          GCP_PROJECT_ID:      ${{ secrets.GCP_PROJECT_ID }}
+          GCP_SA_KEY:          ${{ secrets.GCP_SA_KEY }}
+          BQ_DATASET:          ${{ vars.BQ_DATASET }}     # non-secret config var
+          BQ_TABLE:            ${{ vars.BQ_TABLE }}       # non-secret config var
+        run: python pipeline.py
+
+      # 5. Post a Slack/email alert on failure (optional — delete if not needed)
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "Pipeline failed on $(date). Check the Actions log for details."
+          # Uncomment and fill in to send a real alert:
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data '{"text":"⚠️ Leadgen pipeline FAILED — check GitHub Actions"}' \
+          #   ${{ secrets.SLACK_WEBHOOK_URL }}
