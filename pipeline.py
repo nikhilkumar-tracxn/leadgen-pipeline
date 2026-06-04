@@ -128,7 +128,7 @@ FORM_TYPES = {
 
 # Pagination and retry config
 SLEEP_S     = 0.3   # seconds to sleep between API pages (rate-limit safety)
-BATCH_SIZE  = 30    # records per API page (Tracxn API max)
+BATCH_SIZE  = 20    # records per API page (Tracxn API max)
 MAX_RETRIES = 3     # retry attempts per failed API call
 
 
