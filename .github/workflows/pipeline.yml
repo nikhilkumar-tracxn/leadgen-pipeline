@@ -1,54 +1,72 @@
 name: Leadgen BigQuery Pipeline
 
 on:
+  # ── Production schedule: 6:00 AM IST = 00:30 UTC ──────────────────────
   schedule:
-    # Runs daily at 2:00 AM UTC. Adjust to your timezone:
-    # IST = UTC+5:30, so 2:00 AM IST = 8:30 PM UTC previous day
-    - cron: "30 20 * * *"
+    - cron: "30 0 * * *"
 
-  # Allows you to run manually from the GitHub Actions tab
+  # ── Manual trigger with inputs — for testing ──────────────────────────
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "test_auto"
+        type: choice
+        options:
+          - test_auto       # yesterday's date → backup table
+          - test_manual     # specific date you type → backup table
+          - production      # yesterday's date → main table
+      test_date:
+        description: "Date to process (YYYY-MM-DD). Only used when mode=test_manual."
+        required: false
+        default: ""
 
 jobs:
   run-pipeline:
-    name: Run Leadgen Pipeline
+    name: Run Pipeline (${{ github.event.inputs.mode || 'production' }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60         # Hard cap — your job takes ~20 min
+    timeout-minutes: 60
 
     steps:
-      # 1. Check out your repo
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Set up Python
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # 3. Install dependencies
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 4. Run the pipeline
-      #    Secrets are passed in as environment variables.
-      #    They are never printed in logs.
       - name: Run pipeline
         env:
+          # ── Secrets (sensitive) ───────────────────────────────────────
           TRACXN_ACCESS_TOKEN: ${{ secrets.TRACXN_ACCESS_TOKEN }}
           GCP_PROJECT_ID:      ${{ secrets.GCP_PROJECT_ID }}
           GCP_SA_KEY:          ${{ secrets.GCP_SA_KEY }}
-          BQ_DATASET:          ${{ vars.BQ_DATASET }}     # non-secret config var
-          BQ_TABLE:            ${{ vars.BQ_TABLE }}       # non-secret config var
+
+          # ── Non-sensitive config vars ─────────────────────────────────
+          BQ_DATASET:          ${{ vars.BQ_DATASET }}
+          BQ_TABLE:            ${{ vars.BQ_TABLE }}
+          BQ_TABLE_BACKUP:     ${{ vars.BQ_TABLE_BACKUP }}
+
+          # ── Mode: scheduled runs always use 'production'
+          #         manual trigger uses whatever was selected ─────────────
+          MODE:      ${{ github.event.inputs.mode || 'production' }}
+          TEST_DATE: ${{ github.event.inputs.test_date || '' }}
+
         run: python pipeline.py
 
-      # 5. Post a Slack/email alert on failure (optional — delete if not needed)
-      - name: Notify on failure
-        if: failure()
+      - name: Print summary
+        if: always()
         run: |
-          echo "Pipeline failed on $(date). Check the Actions log for details."
-          # Uncomment and fill in to send a real alert:
-          # curl -X POST -H 'Content-type: application/json' \
-          #   --data '{"text":"⚠️ Leadgen pipeline FAILED — check GitHub Actions"}' \
-          #   ${{ secrets.SLACK_WEBHOOK_URL }}
+          echo "### Pipeline Run Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Mode | ${{ github.event.inputs.mode || 'production' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Date Input | ${{ github.event.inputs.test_date || 'N/A (auto)' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered By | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
