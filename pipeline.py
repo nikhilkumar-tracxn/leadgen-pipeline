@@ -218,7 +218,12 @@ def build_user_record(user, form_map, platform_map, target_date) -> dict:
     user_category = ", ".join(cats) if cats else (user.get("userCategory") or "N/A")
 
     cd = user.get("createdDate") or {}
-    created_date = "{}-{:02d}-{:02d}".format(cd.get("year", 2025), cd.get("month", 1), cd.get("day", 1))
+    # API sometimes returns year/month/day as strings instead of ints — force to int
+    created_date = "{}-{:02d}-{:02d}".format(
+        int(cd.get("year") or 2025),
+        int(cd.get("month") or 1),
+        int(cd.get("day") or 1),
+    )
 
     session_id = None
     if reg_type in FORM_TYPES:
