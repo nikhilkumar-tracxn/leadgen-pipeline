@@ -468,20 +468,36 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
     # Session ID: primary source + cross-source fallback
     session_id = None
     if reg_type in FORM_TYPES:
+        # Primary: form map, /signup entries
         entries = sorted(
             [e for e in form_map.get(email, []) if e["path"].startswith("/signup")],
             key=lambda x: x["ts"]
         )
         if entries:
             session_id = entries[0]["sessionId"]
+
+        # Secondary: form map, /activate entries (OAuth users land here after handshake)
+        if not session_id:
+            entries = sorted(
+                [e for e in form_map.get(email, []) if e["path"].startswith("/activate")],
+                key=lambda x: x["ts"]
+            )
+            if entries:
+                session_id = entries[0]["sessionId"]
+
+        # Fallback: platform map
         if not session_id:
             fallback = sorted(platform_map.get(email, []), key=lambda x: x["ts"])
             if fallback:
                 session_id = fallback[0]["sessionId"]
+
     else:
+        # Primary: platform map
         entries = sorted(platform_map.get(email, []), key=lambda x: x["ts"])
         if entries:
             session_id = entries[0]["sessionId"]
+
+        # Fallback: form map (any path)
         if not session_id:
             fallback = sorted(form_map.get(email, []), key=lambda x: x["ts"])
             if fallback:
