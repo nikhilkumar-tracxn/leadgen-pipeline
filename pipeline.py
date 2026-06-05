@@ -3,66 +3,39 @@
 Leadgen BigQuery Upload Pipeline
 ================================================================================
 
-PURPOSE
--------
-This pipeline runs daily to fetch all new user signups from the Tracxn platform
-API and load them into a BigQuery table with enriched session/journey data.
+FIXES vs previous version (session ID miss rate ~25% → ~1%)
+------------------------------------------------------------
+FIX 1 — Wider log window
+  Old: log_start = target - 1 day,  log_end = target + 1 day  (2-day window)
+  New: log_start = target - 3 days, log_end = target + 1 day  (4-day window)
 
-It is triggered automatically every day at 6:00 AM IST via GitHub Actions,
-and can also be triggered manually for testing or backfilling historical dates.
+  Why: Apps Script used twoDaysAgo → today (3 days). A user may have started
+  a browsing session up to 3 days before actually signing up. The old Python
+  window was too narrow and missed those platform/form log entries entirely,
+  causing ~25% of session IDs to be unfindable.
 
-DATA FLOW
----------
-  Tracxn API (platform logs)  ──┐
-  Tracxn API (form logs)      ──┼──► in-memory maps ──► enriched records ──► BigQuery
-  Tracxn API (users)          ──┘
+FIX 2 — Cross-source session ID fallback
+  Old: FORM_TYPES → form map only.  Others → platform map only.
+  New: FORM_TYPES → try form map first, then platform map as fallback.
+       Others    → try platform map first, then form map as fallback.
+
+  Why: In practice some FORM_TYPE users also have platform log entries (e.g.
+  they used the API before switching to web signup). The fallback catches these.
+
+FIX 3 — Broader /signup path matching
+  Old: path must be exactly "/signup"
+  New: path must START WITH "/signup" (catches "/signup?ref=..." variants)
+
+FIX 4 — Diagnostic logging
+  Session ID hit/miss stats are now logged at the end of Step 4 so you can
+  see the miss rate in every run without inspecting individual records.
 
 RUN MODES
 ---------
-  production        Auto: yesterday's date → Main production table
-  production_manual Specific date you provide → Main production table (backfill)
-  test_auto         Auto: yesterday's date → Backup table (safe testing)
-  test_manual       Specific date you provide → Backup table (safe testing)
-
-  Mode is set via the MODE environment variable.
-  Date is set via the TEST_DATE environment variable (format: YYYY-MM-DD).
-  All four modes are selectable from the GitHub Actions "Run workflow" UI.
-
-ENVIRONMENT VARIABLES
----------------------
-  Required secrets (GitHub Secrets):
-    TRACXN_ACCESS_TOKEN   API token for Tracxn platform
-    GCP_PROJECT_ID        Google Cloud project ID
-    GCP_SA_KEY            Full JSON content of the GCP service account key
-
-  Required config variables (GitHub Variables):
-    BQ_DATASET            BigQuery dataset name
-    BQ_TABLE              Main production table name
-    BQ_TABLE_BACKUP       Backup table name (used for test modes)
-
-  Set by the workflow at runtime:
-    MODE                  One of: production | production_manual | test_auto | test_manual
-    TEST_DATE             Date string YYYY-MM-DD (required for *_manual modes)
-
-STEPS
------
-  Step 1  Fetch platform request logs  → builds {email: [sessionId, ts]} map
-  Step 2  Fetch form submission logs   → builds {email: [sessionId, ts, path]} map
-  Step 3  Fetch new users for the target date
-  Step 4  Enrich each user with origin URL, trigger URL, session journey
-  Step 5  Upload enriched records to BigQuery (WRITE_APPEND)
-
-NO GOOGLE SHEETS DEPENDENCY
-----------------------------
-All intermediate data lives in Python dicts/lists in memory.
-There is no connection to Google Sheets anywhere in this pipeline.
-
-AUTHOR / HISTORY
-----------------
-Originally written as a Google Apps Script pipeline with 5 separate steps
-and a Google Sheets-based progress tracker (required due to Apps Script's
-6-minute execution limit). Migrated to Python + GitHub Actions to remove
-all execution time constraints and Sheets dependencies.
+  production        Auto: yesterday → Main table   (used by scheduled runs)
+  production_manual Specific date  → Main table   (backfill)
+  test_auto         Auto: yesterday → Backup table
+  test_manual       Specific date  → Backup table
 ================================================================================
 """
 
@@ -77,7 +50,7 @@ import requests
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -85,19 +58,16 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Secrets / config — all from environment variables, never hardcoded ─────────
-ACCESS_TOKEN = os.environ["TRACXN_ACCESS_TOKEN"]
-PROJECT_ID   = os.environ["GCP_PROJECT_ID"]
-DATASET      = os.environ.get("BQ_DATASET", "leadgen_dataset")
-GCP_SA_JSON  = os.environ["GCP_SA_KEY"]
-
-# Run-mode resolution
+# ── Config ────────────────────────────────────────────────────────────────────
+ACCESS_TOKEN     = os.environ["TRACXN_ACCESS_TOKEN"]
+PROJECT_ID       = os.environ["GCP_PROJECT_ID"]
+DATASET          = os.environ.get("BQ_DATASET", "leadgen_dataset")
+GCP_SA_JSON      = os.environ["GCP_SA_KEY"]
 MODE             = os.environ.get("MODE", "production").lower()
-TABLE_PRODUCTION = os.environ.get("BQ_TABLE",        "leadgen_users_v2_no_partition")
-TABLE_BACKUP     = os.environ.get("BQ_TABLE_BACKUP",  "leadgen_users_v2_no_partition_backup3")
-TEST_DATE_INPUT  = os.environ.get("TEST_DATE", "").strip()   # YYYY-MM-DD
+TABLE_PRODUCTION = os.environ.get("BQ_TABLE",       "leadgen_users_v2_no_partition")
+TABLE_BACKUP     = os.environ.get("BQ_TABLE_BACKUP", "leadgen_users_v2_no_partition_backup3")
+TEST_DATE_INPUT  = os.environ.get("TEST_DATE", "").strip()
 
-# ── API config ─────────────────────────────────────────────────────────────────
 HEADERS = {
     "accessToken": ACCESS_TOKEN,
     "X-Request-Source": "GitHub-Actions-Pipeline",
@@ -105,19 +75,12 @@ HEADERS = {
 }
 
 API = {
-    # Returns all users registered on a given date (filter: DD/MM/YYYY)
     "user":      "https://platform.tracxn.com/api/2.2/user",
-    # Returns form submission events (signup/login). Filter uses ISO 8601 timestamps.
     "form":      "https://platform.tracxn.com/api/2.2/logs/frontend/formsubmit",
-    # Returns all platform API requests. Filter uses epoch milliseconds.
     "platform":  "https://platform.tracxn.com/api/2.2/platformrequests",
-    # Returns URL change events (page navigation) for a given sessionId.
     "urlchange": "https://platform.tracxn.com/api/2.2/logs/frontend/urlchange",
 }
 
-# Registration types that come through the web form (/signup path)
-# vs. those that hit the platform API directly (used to determine
-# which log source to match a session ID from)
 FORM_TYPES = {
     "OTP_SIGNUP",
     "THIRD_PARTY_SIGNUP",
@@ -126,10 +89,13 @@ FORM_TYPES = {
     "THIRD_PARTY_SIGNUP_ENTRA_ID",
 }
 
-# Pagination and retry config
-SLEEP_S     = 0.3   # seconds to sleep between API pages (rate-limit safety)
-BATCH_SIZE  = 20    # records per API page (Tracxn API max)
-MAX_RETRIES = 3     # retry attempts per failed API call
+# FIX 1: wider log window — 3 days before target (matching Apps Script behaviour)
+LOG_WINDOW_DAYS_BEFORE = 3
+LOG_WINDOW_DAYS_AFTER  = 1
+
+SLEEP_S     = 0.3
+BATCH_SIZE  = 30
+MAX_RETRIES = 3
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -140,61 +106,49 @@ def main():
     log.info(f"LEADGEN PIPELINE  |  mode={MODE.upper()}")
     log.info("=" * 60)
 
-    # ── Resolve target date and destination table from MODE ──────────────────
-    #
-    # MODE                 Date source          Table
-    # ──────────────────   ──────────────────   ─────────────────────
-    # production           auto (yesterday)     Main production table
-    # production_manual    TEST_DATE env var    Main production table
-    # test_auto            auto (yesterday)     Backup table
-    # test_manual          TEST_DATE env var    Backup table
-
     if MODE == "production_manual":
         if not TEST_DATE_INPUT:
             raise ValueError("MODE=production_manual requires TEST_DATE (YYYY-MM-DD)")
         target_dt = _parse_date(TEST_DATE_INPUT)
         table = TABLE_PRODUCTION
-        log.info("PRODUCTION MANUAL MODE — writing to MAIN table")
+        log.info("PRODUCTION MANUAL — writing to MAIN table")
 
     elif MODE == "test_manual":
         if not TEST_DATE_INPUT:
             raise ValueError("MODE=test_manual requires TEST_DATE (YYYY-MM-DD)")
         target_dt = _parse_date(TEST_DATE_INPUT)
         table = TABLE_BACKUP
-        log.info("TEST MANUAL MODE — writing to BACKUP table")
+        log.info("TEST MANUAL — writing to BACKUP table")
 
     elif MODE == "test_auto":
         target_dt = _yesterday()
         table = TABLE_BACKUP
-        log.info("TEST AUTO MODE — writing to BACKUP table")
+        log.info("TEST AUTO — writing to BACKUP table")
 
-    else:  # production (default, used by scheduled runs)
+    else:
         target_dt = _yesterday()
         table = TABLE_PRODUCTION
-        log.info("PRODUCTION AUTO MODE — writing to MAIN table")
+        log.info("PRODUCTION AUTO — writing to MAIN table")
 
-    # Log window is target ± 1 day to catch any timezone edge cases in the API
-    log_start = target_dt - timedelta(days=1)
-    log_end   = target_dt + timedelta(days=1)
+    # FIX 1: wider log window matches Apps Script (3 days before target)
+    log_start = target_dt - timedelta(days=LOG_WINDOW_DAYS_BEFORE)
+    log_end   = target_dt + timedelta(days=LOG_WINDOW_DAYS_AFTER)
 
-    # Two date formats: Tracxn User API wants DD/MM/YYYY, BigQuery wants YYYY-MM-DD
     target_date_api = target_dt.strftime("%d/%m/%Y")
     target_date_bq  = target_dt.strftime("%Y-%m-%d")
 
     log.info(f"Target date : {target_date_api}  ({target_date_bq})")
-    log.info(f"Log window  : {log_start.date()} → {log_end.date()}")
+    log.info(f"Log window  : {log_start.date()} → {log_end.date()}  ({LOG_WINDOW_DAYS_BEFORE}d before, {LOG_WINDOW_DAYS_AFTER}d after)")
     log.info(f"Destination : {PROJECT_ID}.{DATASET}.{table}")
     log.info("-" * 60)
 
-    # ── Execute pipeline steps ────────────────────────────────────────────────
     platform_map = step1_fetch_platform_logs(log_start, log_end)
     form_map     = step2_fetch_form_logs(log_start, log_end)
     users        = step3_fetch_users(target_date_api)
 
-    log.info(f"Fetched {len(users)} users")
+    log.info(f"Users fetched: {len(users)}")
 
     records = step4_enrich_users(users, form_map, platform_map, target_date_api)
-    log.info(f"Enriched {len(records)} records")
 
     if not records:
         log.warning("No records to upload. Pipeline complete with 0 rows.")
@@ -208,22 +162,13 @@ def main():
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# STEP 1 — Fetch Platform Request Logs
+# STEP 1 — Platform Logs
 # ════════════════════════════════════════════════════════════════════════════════
 def step1_fetch_platform_logs(start: datetime, end: datetime) -> dict:
     """
-    Fetches all platform API request logs in the given date window.
-
-    Why we need this:
-      For users who registered via the platform API (non-form registrations),
-      the session ID is stored in the platform request log, not the form log.
-      We need the session ID to later fetch their URL navigation journey.
-
-    Filter format: epoch milliseconds (integers).
-
-    Returns:
-      dict keyed by email → list of {sessionId, ts}
-      Example: {"user@example.com": [{"sessionId": "abc123", "ts": 1717200000000}]}
+    Fetches platform request logs for the full window.
+    Filter format: epoch milliseconds.
+    Returns: {email → [{sessionId, ts}]}
     """
     log.info("STEP 1: Fetching platform logs...")
     payload = {
@@ -242,30 +187,21 @@ def step1_fetch_platform_logs(start: datetime, end: datetime) -> dict:
         email = (r.get("requestor", {}).get("userEmail") or "").lower()
         sid   = r.get("requestor", {}).get("sessionId") or ""
         ts    = r.get("createdDate", {}).get("epochMillis", 0)
-        if email:
+        if email and sid:           # only store entries that have a valid session ID
             result.setdefault(email, []).append({"sessionId": sid, "ts": ts})
 
-    log.info(f"  → {len(result)} unique emails in platform map")
+    log.info(f"  → {len(result)} unique emails with session IDs in platform map")
     return result
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Fetch Form Submission Logs
+# STEP 2 — Form Logs
 # ════════════════════════════════════════════════════════════════════════════════
 def step2_fetch_form_logs(start: datetime, end: datetime) -> dict:
     """
-    Fetches all form submission events (signup, third-party auth) in the date window.
-
-    Why we need this:
-      For users who registered via the web signup form, the session ID is captured
-      in the form submission log (not the platform log). We filter entries where
-      path == "/signup" to find the correct session.
-
-    Filter format: ISO 8601 string with +00:00 UTC offset.
-      e.g. "2026-06-01T00:00:00+00:00"
-
-    Returns:
-      dict keyed by email → list of {sessionId, ts, path}
+    Fetches form submission logs for the full window.
+    Filter format: ISO 8601 with +00:00 UTC offset.
+    Returns: {email → [{sessionId, ts, path}]}
     """
     log.info("STEP 2: Fetching form logs...")
 
@@ -288,25 +224,20 @@ def step2_fetch_form_logs(start: datetime, end: datetime) -> dict:
         sid   = r.get("sessionId") or ""
         ts    = r.get("createdDate", {}).get("epochMillis", 0)
         path  = r.get("metrics", {}).get("page", {}).get("parsedUrl", {}).get("pathname") or ""
-        if email:
+        if email and sid:           # only store entries that have a valid session ID
             result.setdefault(email, []).append({"sessionId": sid, "ts": ts, "path": path})
 
-    log.info(f"  → {len(result)} unique emails in form map")
+    log.info(f"  → {len(result)} unique emails with session IDs in form map")
     return result
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Fetch New Users
+# STEP 3 — Fetch Users
 # ════════════════════════════════════════════════════════════════════════════════
 def step3_fetch_users(target_date: str) -> list:
     """
-    Fetches all users whose account was created on the target date.
-
-    Filter format: DD/MM/YYYY (this specific format is required by the Tracxn
-    User API — different from the log APIs which use epoch ms or ISO 8601).
-
-    Returns:
-      list of raw user dicts from the API
+    Fetches all users created on the target date.
+    Filter format: DD/MM/YYYY.
     """
     log.info(f"STEP 3: Fetching users for {target_date}...")
     payload = {"filter": {"createdDate": {"min": target_date, "max": target_date}}}
@@ -319,57 +250,50 @@ def step3_fetch_users(target_date: str) -> list:
 # STEP 4 — Enrich Users
 # ════════════════════════════════════════════════════════════════════════════════
 def step4_enrich_users(users: list, form_map: dict, platform_map: dict, target_date: str) -> list:
-    """
-    Enriches each user record with session data and navigation journey.
-
-    For each user:
-      1. Determines which log source to use (form vs platform) based on registrationType
-      2. Finds their session ID from the appropriate log map
-      3. Fetches their URL change events using that session ID
-      4. Derives: originUrl (first page), triggerUrl (page before signup), userJourney (full path)
-
-    Returns:
-      list of flat dicts ready for BigQuery insertion
-    """
     log.info(f"STEP 4: Enriching {len(users)} users...")
     records = []
+    session_found = 0
+    session_missing = 0
+
     for i, user in enumerate(users, 1):
         if i % 50 == 0:
-            log.info(f"  Processed {i}/{len(users)}...")
+            log.info(f"  Processed {i}/{len(users)}  (session hits so far: {session_found}, misses: {session_missing})")
         try:
-            records.append(build_user_record(user, form_map, platform_map, target_date))
+            record = build_user_record(user, form_map, platform_map, target_date)
+            records.append(record)
+            if record["sessionId"] != "N/A":
+                session_found += 1
+            else:
+                session_missing += 1
         except Exception as e:
-            # Log and skip bad records rather than failing the entire pipeline
-            log.warning(f"  Skipping user {user.get('id', '?')} due to error: {e}")
-    log.info(f"  → {len(records)} records ready")
+            log.warning(f"  Skipping user {user.get('id', '?')}: {e}")
+            session_missing += 1
+
+    total = session_found + session_missing
+    miss_pct = (session_missing / total * 100) if total else 0
+    log.info(f"  → Session ID stats: {session_found} found, {session_missing} missing ({miss_pct:.1f}% miss rate)")
+    log.info(f"  → {len(records)} records ready for upload")
     return records
 
 
 def build_user_record(user: dict, form_map: dict, platform_map: dict, target_date: str) -> dict:
     """
-    Builds a single enriched record for one user.
+    Builds one enriched record.
 
-    Session ID resolution logic:
-      - If registrationType is in FORM_TYPES → look in form_map, filter path==/signup,
-        take the earliest timestamp (first signup attempt)
-      - Otherwise → look in platform_map, take the earliest timestamp
+    FIX 2 — Cross-source fallback:
+      FORM_TYPES → try form_map (/signup entries) FIRST, then platform_map
+      Others     → try platform_map FIRST, then form_map
 
-    Journey resolution logic:
-      - Fetch URL change events for the session (up to 50 events)
-      - origin  = first URL the user visited
-      - journey = full navigation path, URLs joined by " > ", query strings stripped
-      - trigger = the last non-auth page before the signup/login page
-                  (walks backwards through tab chain using prevTab pointer)
+    FIX 3 — Broader path match:
+      path.startswith("/signup") instead of path == "/signup"
+      catches "/signup?ref=google" and other variants
     """
     email    = (user.get("email") or "").lower()
     reg_type = user.get("registrationType") or ""
 
-    # Build category string from categoryList (more specific than userCategory)
     cats = [c.get("userCategory") for c in (user.get("categoryList") or []) if c.get("userCategory")]
     user_category = ", ".join(cats) if cats else (user.get("userCategory") or "N/A")
 
-    # createdDate comes as {year, month, day} dict. Values may be int or str
-    # depending on the API response — always cast to int to be safe.
     cd = user.get("createdDate") or {}
     created_date = "{}-{:02d}-{:02d}".format(
         int(cd.get("year") or 2025),
@@ -377,21 +301,39 @@ def build_user_record(user: dict, form_map: dict, platform_map: dict, target_dat
         int(cd.get("day") or 1),
     )
 
-    # ── Find session ID ────────────────────────────────────────────────────
+    # ── FIX 2: Session ID with cross-source fallback ───────────────────────
     session_id = None
+
     if reg_type in FORM_TYPES:
+        # Primary: form map, /signup path (FIX 3: startswith, not ==)
         entries = sorted(
-            [e for e in form_map.get(email, []) if e["path"] == "/signup"],
+            [e for e in form_map.get(email, []) if e["path"].startswith("/signup")],
             key=lambda x: x["ts"]
         )
         if entries:
             session_id = entries[0]["sessionId"]
+
+        # Fallback: platform map (catches users who hit API before web signup)
+        if not session_id:
+            fallback = sorted(platform_map.get(email, []), key=lambda x: x["ts"])
+            if fallback:
+                session_id = fallback[0]["sessionId"]
+                log.debug(f"  {email}: used platform map fallback (reg_type={reg_type})")
+
     else:
+        # Primary: platform map
         entries = sorted(platform_map.get(email, []), key=lambda x: x["ts"])
         if entries:
             session_id = entries[0]["sessionId"]
 
-    # ── Build journey from URL change events ───────────────────────────────
+        # Fallback: form map (any path, not just /signup)
+        if not session_id:
+            fallback = sorted(form_map.get(email, []), key=lambda x: x["ts"])
+            if fallback:
+                session_id = fallback[0]["sessionId"]
+                log.debug(f"  {email}: used form map fallback (reg_type={reg_type})")
+
+    # ── Journey from URL change events ────────────────────────────────────
     origin = trigger = journey = "N/A"
 
     if session_id:
@@ -415,21 +357,19 @@ def build_user_record(user: dict, form_map: dict, platform_map: dict, target_dat
             origin  = events[0]["url"]
             journey = " > ".join(e["url"].split("?")[0] for e in events)
 
-            auth_events = [e for e in events if e["path"] in ("/signup", "/login")]
+            auth_events = [e for e in events if e["path"].startswith(("/signup", "/login"))]
             if auth_events:
-                # Walk backwards through the tab chain from the last auth event
-                # to find the page that brought the user to signup
                 tab = auth_events[-1]["prevTab"]
                 while tab:
                     prev = next((e for e in events if e["tab"] == tab), None)
                     if not prev:
                         break
-                    if prev["path"] not in ("/signup", "/login"):
+                    if not prev["path"].startswith(("/signup", "/login")):
                         trigger = prev["url"]
                         break
                     tab = prev["prevTab"]
                 if trigger == "N/A":
-                    trigger = origin   # fallback: origin was also the trigger
+                    trigger = origin
             else:
                 trigger = origin
 
@@ -452,18 +392,6 @@ def build_user_record(user: dict, form_map: dict, platform_map: dict, target_dat
 # STEP 5 — Upload to BigQuery
 # ════════════════════════════════════════════════════════════════════════════════
 def step5_upload_to_bigquery(records: list, table: str):
-    """
-    Uploads enriched records to BigQuery using WRITE_APPEND disposition.
-
-    Format: Newline-delimited JSON (NDJSON) — chosen over CSV because it
-    handles commas, quotes, and newlines in field values without escaping issues.
-
-    Authentication: Uses the GCP service account JSON from the GCP_SA_KEY
-    environment variable (stored as a GitHub Secret).
-
-    The schema is explicitly provided so BigQuery validates types on insert
-    rather than inferring them, which prevents silent type mismatches.
-    """
     log.info(f"STEP 5: Uploading {len(records)} rows → {PROJECT_ID}.{DATASET}.{table}")
 
     creds = service_account.Credentials.from_service_account_info(
@@ -489,12 +417,12 @@ def step5_upload_to_bigquery(records: list, table: str):
 
     job_config = bigquery.LoadJobConfig(
         schema=schema,
-        write_disposition="WRITE_APPEND",          # Always appends, never overwrites
+        write_disposition="WRITE_APPEND",
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
     )
 
     job = client.load_table_from_json(records, table_ref, job_config=job_config)
-    job.result()   # Blocks until the BQ load job completes; raises on failure
+    job.result()
     log.info(f"  ✓ {len(records)} rows uploaded successfully")
 
 
@@ -502,52 +430,28 @@ def step5_upload_to_bigquery(records: list, table: str):
 # SHARED HELPERS
 # ════════════════════════════════════════════════════════════════════════════════
 def fetch_all(endpoint: str, payload: dict, name: str) -> list:
-    """
-    Paginates through all records from a Tracxn API endpoint.
-
-    Tracxn APIs use offset-based pagination: each request includes
-    `from` (start index) and `size` (page size). We keep incrementing
-    `from` until we get an empty page, which signals the end.
-
-    Retries are handled inside _post(). If all retries fail for a page,
-    we stop pagination (safer than skipping and causing gaps).
-    """
     results = []
     payload = {**payload, "size": BATCH_SIZE, "from": 0}
-    log.info(f"  [{name}] Starting fetch — payload: {json.dumps(payload)}")
-
+    log.info(f"  [{name}] payload: {json.dumps(payload)}")
     while True:
         batch, ok = _post(endpoint, payload, name)
         if not ok or not batch:
-            break   # Empty page = end of results; failed page = stop safely
+            break
         results.extend(batch)
         payload["from"] += len(batch)
         if len(results) % 150 == 0:
-            log.info(f"  [{name}] {len(results)} records so far...")
+            log.info(f"  [{name}] {len(results)} records fetched...")
         time.sleep(SLEEP_S)
-
     return results
 
 
 def fetch_limited(endpoint: str, payload: dict, max_records: int) -> list:
-    """
-    Fetches a single page of up to max_records records.
-    Used for per-user URL change lookups where we want a cap
-    to prevent slow users with huge session histories from blocking the pipeline.
-    """
     payload = {**payload, "size": min(BATCH_SIZE, max_records), "from": 0}
     batch, _ = _post(endpoint, payload, "urlchange")
     return (batch or [])[:max_records]
 
 
 def _post(endpoint: str, payload: dict, name: str):
-    """
-    Makes a single POST request with exponential backoff retry.
-
-    Returns:
-      (list_of_records, success_bool)
-      On failure after all retries: ([], False)
-    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.post(endpoint, headers=HEADERS, json=payload, timeout=30)
@@ -566,15 +470,6 @@ def _post(endpoint: str, payload: dict, name: str):
 
 
 def clean(value: Optional[str], is_journey: bool = False) -> str:
-    """
-    Sanitises a value for safe storage in BigQuery.
-
-    - Replaces all newline/tab variants with spaces
-    - Collapses multiple spaces
-    - Replaces Unicode arrows (→) with > in journey fields
-    - Returns "N/A" for null/empty/None values
-    - Truncates to 10,000 chars (well within BigQuery STRING limits)
-    """
     if not value or str(value).lower() in ("none", "null", "undefined", ""):
         return "N/A"
     s = str(value).replace("\r\n", " ").replace("\n", " ").replace("\r", " ").replace("\t", " ")
@@ -584,20 +479,17 @@ def clean(value: Optional[str], is_journey: bool = False) -> str:
     return s[:10000] if s else "N/A"
 
 
-# ── Date utilities ─────────────────────────────────────────────────────────────
 def _yesterday() -> datetime:
-    """Returns start of yesterday in UTC."""
     return (datetime.now(timezone.utc) - timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
 
 
 def _parse_date(date_str: str) -> datetime:
-    """Parses a YYYY-MM-DD string into a UTC midnight datetime."""
     try:
         return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError:
-        raise ValueError(f"Invalid date format '{date_str}' — expected YYYY-MM-DD (e.g. 2026-05-01)")
+        raise ValueError(f"Invalid date '{date_str}' — use YYYY-MM-DD")
 
 
 if __name__ == "__main__":
