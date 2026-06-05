@@ -519,18 +519,6 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
                 chosen = sorted(before or fallback, key=lambda x: x["ts"])
                 session_id = chosen[0]["sessionId"]
 
-    else:
-        # Primary: platform map
-        entries = sorted(platform_map.get(email, []), key=lambda x: x["ts"])
-        if entries:
-            session_id = entries[0]["sessionId"]
-
-        # Fallback: form map (any path)
-        if not session_id:
-            fallback = sorted(form_map.get(email, []), key=lambda x: x["ts"])
-            if fallback:
-                session_id = fallback[0]["sessionId"]
-
     # Journey
     origin = trigger = journey = "N/A"
     if session_id:
