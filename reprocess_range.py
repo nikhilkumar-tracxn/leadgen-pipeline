@@ -466,30 +466,58 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
     )
 
     # Session ID: primary source + cross-source fallback
-    session_id = None
-    if reg_type in FORM_TYPES:
-        # Primary: form map, /signup entries
-        entries = sorted(
-            [e for e in form_map.get(email, []) if e["path"].startswith("/signup")],
-            key=lambda x: x["ts"]
-        )
-        if entries:
-            session_id = entries[0]["sessionId"]
+    # ── Session ID — earliest entry before user createdDate ───────────────
+    # Convert user-created date to epoch millis for comparison
+    created_epoch = None
+    if cd:
+        try:
+            created_epoch = int(datetime(
+                int(cd.get("year") or 2025),
+                int(cd.get("month") or 1),
+                int(cd.get("day") or 1),
+                tzinfo=timezone.utc
+            ).timestamp() * 1000)
+        except Exception:
+            created_epoch = None
 
-        # Secondary: form map, /activate entries (OAuth users land here after handshake)
-        if not session_id:
-            entries = sorted(
-                [e for e in form_map.get(email, []) if e["path"].startswith("/activate")],
-                key=lambda x: x["ts"]
-            )
-            if entries:
-                session_id = entries[0]["sessionId"]
+    session_id = None
+
+    if reg_type in FORM_TYPES:
+        # Collect all /signup and /activate entries from form map
+        candidates = [
+            e for e in form_map.get(email, [])
+            if e["path"].startswith("/signup") or e["path"].startswith("/activate")
+        ]
+
+        if candidates:
+            # Prefer entries before user createdDate; fall back to earliest overall
+            before = [e for e in candidates if created_epoch is None or e["ts"] < created_epoch]
+            chosen = sorted(before or candidates, key=lambda x: x["ts"])
+            session_id = chosen[0]["sessionId"]
 
         # Fallback: platform map
         if not session_id:
-            fallback = sorted(platform_map.get(email, []), key=lambda x: x["ts"])
+            fallback = platform_map.get(email, [])
             if fallback:
-                session_id = fallback[0]["sessionId"]
+                before = [e for e in fallback if created_epoch is None or e["ts"] < created_epoch]
+                chosen = sorted(before or fallback, key=lambda x: x["ts"])
+                session_id = chosen[0]["sessionId"]
+
+    else:
+        # Primary: platform map
+        entries = platform_map.get(email, [])
+        if entries:
+            before = [e for e in entries if created_epoch is None or e["ts"] < created_epoch]
+            chosen = sorted(before or entries, key=lambda x: x["ts"])
+            session_id = chosen[0]["sessionId"]
+
+        # Fallback: form map (any path)
+        if not session_id:
+            fallback = form_map.get(email, [])
+            if fallback:
+                before = [e for e in fallback if created_epoch is None or e["ts"] < created_epoch]
+                chosen = sorted(before or fallback, key=lambda x: x["ts"])
+                session_id = chosen[0]["sessionId"]
 
     else:
         # Primary: platform map
