@@ -73,7 +73,6 @@ from datetime import datetime, timedelta, timezone, date
 from typing import Optional
 
 import requests
-import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -308,17 +307,37 @@ def _atomic_replace_day(bq, table_ref: str, records: list, date_str: str):
     """
     Replaces all rows for date_str in table_ref with the new records.
     Uses the atomic swap pattern — all other dates are untouched.
+
+    We use load_table_from_json with an explicit schema (not autodetect)
+    so that createdDate is correctly typed as DATE in the temp table.
+    autodetect would infer "2026-05-01" as STRING, causing the UNION ALL
+    to fail with "incompatible types: DATE, STRING".
     """
     temp_id = f"{PROJECT_ID}.{DATASET}.temp_reprocess_{uuid.uuid4().hex[:8]}"
 
+    # Explicit schema — must match the main table exactly
+    schema = [
+        bigquery.SchemaField("createdDate",       "DATE",   mode="NULLABLE"),
+        bigquery.SchemaField("id",                "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("email",             "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("userCategory",      "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("originUrl",         "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("triggerUrl",        "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("geography",         "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("registrationType",  "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("sessionId",         "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("userJourney",       "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("cta",               "STRING", mode="NULLABLE"),
+    ]
+
     try:
-        # Write new records to temp table
-        df = pd.DataFrame(records)
+        # Write to temp table via NDJSON with explicit schema
         job_config = bigquery.LoadJobConfig(
+            schema=schema,
             write_disposition="WRITE_TRUNCATE",
-            autodetect=True,
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         )
-        bq.load_table_from_dataframe(df, temp_id, job_config=job_config).result()
+        bq.load_table_from_json(records, temp_id, job_config=job_config).result()
 
         # Atomic swap: rebuild table excluding this date, then add new rows
         sql = f"""
