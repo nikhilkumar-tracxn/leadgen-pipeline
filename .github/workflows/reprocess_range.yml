@@ -1,0 +1,93 @@
+# ================================================================================
+# Reprocess Range Workflow  —  reprocess_range.yml
+# ================================================================================
+#
+# PURPOSE
+#   Manually reprocesses a date range using the fixed pipeline logic.
+#   Designed as a one-off correction tool — no scheduled runs.
+#
+# HOW TO RUN
+#   Actions tab → Reprocess Date Range → Run workflow
+#   Fill in start date, end date, and whether to dry-run first.
+#
+# SAFETY
+#   - dry_run=true  → logs every decision, writes NOTHING to BigQuery
+#   - dry_run=false → actually updates BigQuery (only days where new data is better)
+#   Always run with dry_run=true first to preview what would change.
+#
+# PER-DAY LOGIC
+#   For each day in the range:
+#     1. Count existing session ID misses in BigQuery for that day
+#     2. Re-fetch and re-enrich users from the API with fixed logic
+#     3. Count new session ID misses
+#     4. If new < existing → REPLACE that day's data
+#        If new >= existing → SKIP (never make things worse)
+#
+# USES SAME SECRETS / VARIABLES AS pipeline.yml — no new secrets needed
+# ================================================================================
+
+name: Reprocess Date Range
+
+on:
+  workflow_dispatch:
+    inputs:
+      reprocess_start:
+        description: "Start date (YYYY-MM-DD)  e.g. 2026-05-01"
+        required: true
+        default: ""
+      reprocess_end:
+        description: "End date (YYYY-MM-DD)  e.g. 2026-05-31"
+        required: true
+        default: ""
+      dry_run:
+        description: "Dry run? true = log decisions only, false = write to BigQuery"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  reprocess:
+    name: "Reprocess ${{ github.event.inputs.reprocess_start }} → ${{ github.event.inputs.reprocess_end }} (dry=${{ github.event.inputs.dry_run }})"
+    runs-on: ubuntu-latest
+    # May 2026 = 31 days × ~2 min/day = ~62 min. 180 min covers full months safely.
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run reprocess pipeline
+        env:
+          TRACXN_ACCESS_TOKEN: ${{ secrets.TRACXN_ACCESS_TOKEN }}
+          GCP_PROJECT_ID:      ${{ secrets.GCP_PROJECT_ID }}
+          GCP_SA_KEY:          ${{ secrets.GCP_SA_KEY }}
+          BQ_DATASET:          ${{ vars.BQ_DATASET }}
+          BQ_TABLE:            ${{ vars.BQ_TABLE }}
+          REPROCESS_START:     ${{ github.event.inputs.reprocess_start }}
+          REPROCESS_END:       ${{ github.event.inputs.reprocess_end }}
+          DRY_RUN:             ${{ github.event.inputs.dry_run }}
+        run: python reprocess_range.py
+
+      - name: Write run summary
+        if: always()
+        run: |
+          echo "### Reprocess Run Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Start date** | ${{ github.event.inputs.reprocess_start }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **End date** | ${{ github.event.inputs.reprocess_end }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Dry run** | ${{ github.event.inputs.dry_run }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
