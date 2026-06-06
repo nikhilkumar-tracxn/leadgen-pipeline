@@ -241,18 +241,11 @@ def _process_one_day(bq, table_ref, target_dt, date_str, date_api_str) -> dict:
         # No existing data — just insert
         decision = "INSERT"
         reason   = "No existing data for this date"
-    elif new_miss < existing_stats["missing"]:
-        # New data is strictly better
-        decision = "REPLACE"
-        reason   = (f"New miss count ({new_miss}) < existing ({existing_stats['missing']}) "
-                    f"— improvement of {existing_stats['missing'] - new_miss} rows")
-    elif new_miss == existing_stats["missing"]:
-        decision = "SKIP"
-        reason   = f"Same miss count ({new_miss}) — no improvement, keeping existing data"
     else:
-        decision = "SKIP"
-        reason   = (f"New miss count ({new_miss}) > existing ({existing_stats['missing']}) "
-                    f"— new data is worse, keeping existing")
+        # Always replace with freshly processed data
+        decision = "REPLACE"
+        reason   = (f"New miss count ({new_miss}) vs existing ({existing_stats['missing']}) "
+                    f"— replacing with latest processed data")
 
     log.info(f"  → Decision: {decision}  ({reason})")
 
