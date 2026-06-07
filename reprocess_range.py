@@ -241,11 +241,18 @@ def _process_one_day(bq, table_ref, target_dt, date_str, date_api_str) -> dict:
         # No existing data — just insert
         decision = "INSERT"
         reason   = "No existing data for this date"
-    else:
-        # Always replace with freshly processed data
+    elif new_miss < existing_stats["missing"]:
+        # New data is strictly better
         decision = "REPLACE"
-        reason   = (f"New miss count ({new_miss}) vs existing ({existing_stats['missing']}) "
-                    f"— replacing with latest processed data")
+        reason   = (f"New miss count ({new_miss}) < existing ({existing_stats['missing']}) "
+                    f"— improvement of {existing_stats['missing'] - new_miss} rows")
+    elif new_miss == existing_stats["missing"]:
+        decision = "SKIP"
+        reason   = f"Same miss count ({new_miss}) — no improvement, keeping existing data"
+    else:
+        decision = "SKIP"
+        reason   = (f"New miss count ({new_miss}) > existing ({existing_stats['missing']}) "
+                    f"— new data is worse, keeping existing")
 
     log.info(f"  → Decision: {decision}  ({reason})")
 
@@ -458,59 +465,76 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
         int(cd.get("day") or 1),
     )
 
-    # Session ID: primary source + cross-source fallback
-    # ── Session ID — earliest entry before user createdDate ───────────────
-    # Convert user-created date to epoch millis for comparison
+    # ── Session ID resolution ─────────────────────────────────────────────────
+    #
+    # RULE: we want the session that existed BEFORE the user created their
+    # account — i.e. the browsing session that led them to sign up.
+    # After signup, a user gets new session IDs (post-activate, post-login)
+    # which belong to their in-platform activity, not their acquisition journey.
+    #
+    # Step 1: Convert the user's createdDate to epoch ms for timestamp comparison.
+    # Step 2: For FORM_TYPES users, look in form_map for path==/signup entries
+    #         that occurred BEFORE createdDate.
+    #         Drop /activate — those are post-signup email verification steps
+    #         and always have a later session ID than we want.
+    # Step 3: If no pre-signup /signup entry found, fall back to platform_map
+    #         entries that occurred before createdDate.
+    # Step 4: For non-FORM_TYPES, try platform_map first (pre-signup), then
+    #         form_map as fallback (pre-signup).
+    # Step 5: If absolutely nothing is found before createdDate, fall back to
+    #         the earliest entry overall (rare edge case, e.g. same-millisecond
+    #         timestamps or clock skew between API servers).
+
+    # Convert createdDate {year, month, day} → epoch ms (midnight UTC)
     created_epoch = None
-    if cd:
-        try:
-            created_epoch = int(datetime(
-                int(cd.get("year") or 2025),
-                int(cd.get("month") or 1),
-                int(cd.get("day") or 1),
-                tzinfo=timezone.utc
-            ).timestamp() * 1000)
-        except Exception:
-            created_epoch = None
+    try:
+        created_epoch = int(datetime(
+            int(cd.get("year") or 2025),
+            int(cd.get("month") or 1),
+            int(cd.get("day") or 1),
+            tzinfo=timezone.utc
+        ).timestamp() * 1000)
+    except Exception:
+        created_epoch = None   # if conversion fails, skip the timestamp filter
+
+    def _pick_session(candidates: list) -> str | None:
+        """
+        Given a list of log entries [{sessionId, ts, ...}], returns the
+        sessionId of the entry with the earliest ts that is strictly before
+        created_epoch.  Falls back to the globally earliest entry if nothing
+        qualifies (handles same-ms or missing timestamp edge cases).
+        Returns None if the list is empty.
+        """
+        if not candidates:
+            return None
+        if created_epoch is not None:
+            pre = [e for e in candidates if e["ts"] < created_epoch]
+        else:
+            pre = []
+        pool = sorted(pre if pre else candidates, key=lambda x: x["ts"])
+        return pool[0]["sessionId"] if pool else None
 
     session_id = None
 
     if reg_type in FORM_TYPES:
-        # Collect all /signup and /activate entries from form map
-        candidates = [
+        # Primary: form map, /signup path ONLY (not /activate — those are post-signup)
+        signup_entries = [
             e for e in form_map.get(email, [])
-            if e["path"].startswith("/signup") or e["path"].startswith("/activate")
+            if e["path"].startswith("/signup")
         ]
+        session_id = _pick_session(signup_entries)
 
-        if candidates:
-            # Prefer entries before user createdDate; fall back to earliest overall
-            before = [e for e in candidates if created_epoch is None or e["ts"] < created_epoch]
-            chosen = sorted(before or candidates, key=lambda x: x["ts"])
-            session_id = chosen[0]["sessionId"]
-
-        # Fallback: platform map
+        # Fallback: platform map (pre-signup entries)
         if not session_id:
-            fallback = platform_map.get(email, [])
-            if fallback:
-                before = [e for e in fallback if created_epoch is None or e["ts"] < created_epoch]
-                chosen = sorted(before or fallback, key=lambda x: x["ts"])
-                session_id = chosen[0]["sessionId"]
+            session_id = _pick_session(platform_map.get(email, []))
 
     else:
-        # Primary: platform map
-        entries = platform_map.get(email, [])
-        if entries:
-            before = [e for e in entries if created_epoch is None or e["ts"] < created_epoch]
-            chosen = sorted(before or entries, key=lambda x: x["ts"])
-            session_id = chosen[0]["sessionId"]
+        # Primary: platform map (pre-signup entries)
+        session_id = _pick_session(platform_map.get(email, []))
 
-        # Fallback: form map (any path)
+        # Fallback: form map, any path (pre-signup)
         if not session_id:
-            fallback = form_map.get(email, [])
-            if fallback:
-                before = [e for e in fallback if created_epoch is None or e["ts"] < created_epoch]
-                chosen = sorted(before or fallback, key=lambda x: x["ts"])
-                session_id = chosen[0]["sessionId"]
+            session_id = _pick_session(form_map.get(email, []))
 
     # Journey
     origin = trigger = journey = "N/A"
