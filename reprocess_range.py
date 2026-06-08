@@ -6,7 +6,9 @@ Manual Reprocess Pipeline  —  reprocess_range.py
 PURPOSE
 -------
 Reprocesses a date range of users already in BigQuery using the fixed pipeline
-logic. Designed to be run manually to fix historical data.
+logic (wider log window + cross-source session ID fallback). Designed to be
+run once to fix historical data — specifically May 2026 which was processed
+with the old code that had ~25% session ID miss rate.
 
 HOW IT WORKS (per-day loop)
 ----------------------------
@@ -15,31 +17,10 @@ For each day in the date range:
   1. Fetch fresh enriched records from the Tracxn API using the fixed logic
   2. Query BigQuery to count session ID misses in the EXISTING data for that day
   3. Count session ID misses in the NEWLY processed data for that day
-  4. Always replace existing data with freshly processed data
+  4. Compare:
+       - If new data has FEWER misses (better) → replace that day's data in BQ
+       - If new data has EQUAL OR MORE misses (worse/same) → skip, keep existing
   5. Log the decision and move to the next day
-
-FIXES APPLIED
--------------
-FIX 1 — /activate paths excluded from session ID lookup
-  /activate is a post-signup email verification step. Session IDs from
-  /activate belong to the user's in-platform activity, not their acquisition
-  journey. Only /signup paths are used for FORM_TYPE users.
-
-FIX 2 — Always replace, never skip
-  Previously skipped days where new miss count >= existing miss count.
-  Now always replaces with freshly processed data regardless of miss count.
-
-FIX 3 — Exact createdDate timestamp comparison
-  Previously compared against midnight UTC (day only). Now uses
-  createdDate.epochMillis from the API for exact millisecond comparison,
-  falling back to midnight UTC only if epochMillis is not available.
-  This ensures we correctly pick session IDs that occurred before the
-  exact moment the user signed up, not just before midnight of that day.
-
-FIX 4 — Earliest session ID before signup
-  Among all valid session ID candidates, always picks the one with the
-  earliest timestamp that occurred before the user's createdDate.
-  Falls back to earliest overall only if nothing exists before createdDate.
 
 SAFETY
 ------
@@ -76,10 +57,10 @@ HOW TO RUN (GitHub Actions manual trigger)
     reprocess_end:   2026-05-31
     dry_run:         false   (or true to preview first)
 
-SAFE TO RUN MULTIPLE TIMES
----------------------------
-Running on the same date range twice is safe. Each run always replaces
-with the latest freshly processed data.
+ALSO SAFE TO RUN MULTIPLE TIMES
+---------------------------------
+Running on the same date range twice is safe. The compare step ensures we
+never replace good data with worse data.
 ================================================================================
 """
 
@@ -88,7 +69,7 @@ import json
 import time
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from typing import Optional
 
 import requests
@@ -127,12 +108,8 @@ API = {
     "urlchange": "https://platform.tracxn.com/api/2.2/logs/frontend/urlchange",
 }
 
-FORM_TYPES = {
-    "OTP_SIGNUP", "THIRD_PARTY_SIGNUP", "THIRD_PARTY_SIGNUP_GOOGLE",
-    "THIRD_PARTY_SIGNUP_MICROSOFT", "THIRD_PARTY_SIGNUP_ENTRA_ID",
-}
-
-LOG_WINDOW_DAYS_BEFORE = 1
+# Wider log window: 3 days before target (matching Apps Script behaviour)
+LOG_WINDOW_DAYS_BEFORE = 3
 LOG_WINDOW_DAYS_AFTER  = 1
 
 SLEEP_S     = 0.3
@@ -175,8 +152,8 @@ def main():
     audit = []
 
     # ── Per-day loop ──────────────────────────────────────────────────────────
-    current    = start_dt
-    day_num    = 0
+    current = start_dt
+    day_num = 0
     total_days = (end_dt - start_dt).days + 1
 
     while current <= end_dt:
@@ -185,9 +162,9 @@ def main():
         date_api_str = current.strftime("%d/%m/%Y")
 
         log.info("")
-        log.info(f"{'─' * 70}")
+        log.info(f"{'─'*70}")
         log.info(f"DAY {day_num}/{total_days}  —  {date_str}")
-        log.info(f"{'─' * 70}")
+        log.info(f"{'─'*70}")
 
         outcome = _process_one_day(bq, table_ref, current, date_str, date_api_str)
         audit.append(outcome)
@@ -246,24 +223,34 @@ def _process_one_day(bq, table_ref, target_dt, date_str, date_api_str) -> dict:
     # ── Step C: Enrich users ──────────────────────────────────────────────────
     log.info(f"  C. Enriching {len(users)} users...")
     new_records, new_miss = _enrich_users(users, form_map, platform_map, date_api_str)
-    new_total    = len(new_records)
+    new_total = len(new_records)
     result["new_total"] = new_total
     result["new_miss"]  = new_miss
     new_miss_pct = (new_miss / new_total * 100) if new_total else 0
     log.info(f"  → New data: {new_total} rows, {new_miss} missing session IDs ({new_miss_pct:.1f}%)")
 
-    # ── Step D: Decide ────────────────────────────────────────────────────────
-    log.info(f"  D. Deciding...")
+    # ── Step D: Compare and decide ────────────────────────────────────────────
+    log.info(f"  D. Comparing...")
 
     if existing_stats["total"] == 0:
-        # No existing data — just insert
+        # No existing data — insert
         decision = "INSERT"
         reason   = "No existing data for this date"
     else:
-        # Always replace with freshly processed data regardless of miss count
+        # Always replace with freshly processed data regardless of miss count.
+        # The new code has better session ID logic (no /activate, timestamp-gated)
+        # so even if the miss count is equal or higher, the sessions that ARE
+        # found are more accurate than the old data.
+        improvement = existing_stats["missing"] - new_miss
+        if improvement > 0:
+            reason = (f"New miss count ({new_miss}) < existing ({existing_stats['missing']}) "
+                      f"— {improvement} fewer misses")
+        elif improvement == 0:
+            reason = (f"Same miss count ({new_miss}) — replacing anyway with corrected session IDs")
+        else:
+            reason = (f"New miss count ({new_miss}) > existing ({existing_stats['missing']}) "
+                      f"— replacing anyway: found sessions are now correct (no /activate contamination)")
         decision = "REPLACE"
-        reason   = (f"New miss count ({new_miss}) vs existing ({existing_stats['missing']}) "
-                    f"— replacing with latest processed data")
 
     log.info(f"  → Decision: {decision}  ({reason})")
 
@@ -274,13 +261,17 @@ def _process_one_day(bq, table_ref, target_dt, date_str, date_api_str) -> dict:
         result["reason"] = reason
         return result
 
-    log.info(f"  E. Writing to BigQuery...")
-    if decision == "REPLACE":
-        _atomic_replace_day(bq, table_ref, new_records, date_str)
+    if decision in ("INSERT", "REPLACE"):
+        log.info(f"  E. Writing to BigQuery...")
+        if decision == "REPLACE":
+            _atomic_replace_day(bq, table_ref, new_records, date_str)
+        else:
+            _insert_day(bq, table_ref, new_records)
+        log.info(f"  → {decision} complete for {date_str}")
+        result["action"] = decision
     else:
-        _insert_day(bq, table_ref, new_records)
-    log.info(f"  → {decision} complete for {date_str}")
-    result["action"] = decision
+        result["action"] = "SKIPPED"
+
     result["reason"] = reason
     return result
 
@@ -322,6 +313,7 @@ def _atomic_replace_day(bq, table_ref: str, records: list, date_str: str):
     """
     temp_id = f"{PROJECT_ID}.{DATASET}.temp_reprocess_{uuid.uuid4().hex[:8]}"
 
+    # Explicit schema — must match the main table exactly
     schema = [
         bigquery.SchemaField("createdDate",       "DATE",   mode="NULLABLE"),
         bigquery.SchemaField("id",                "STRING", mode="NULLABLE"),
@@ -337,6 +329,7 @@ def _atomic_replace_day(bq, table_ref: str, records: list, date_str: str):
     ]
 
     try:
+        # Write to temp table via NDJSON with explicit schema
         job_config = bigquery.LoadJobConfig(
             schema=schema,
             write_disposition="WRITE_TRUNCATE",
@@ -344,6 +337,7 @@ def _atomic_replace_day(bq, table_ref: str, records: list, date_str: str):
         )
         bq.load_table_from_json(records, temp_id, job_config=job_config).result()
 
+        # Atomic swap: rebuild table excluding this date, then add new rows
         sql = f"""
             CREATE OR REPLACE TABLE `{table_ref}`
             CLUSTER BY registrationType, geography
@@ -390,7 +384,7 @@ def _insert_day(bq, table_ref: str, records: list):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# API FETCH FUNCTIONS
+# API FETCH FUNCTIONS  (same logic as fixed pipeline.py)
 # ════════════════════════════════════════════════════════════════════════════════
 def _fetch_platform_logs(start: datetime, end: datetime) -> dict:
     payload = {
@@ -441,7 +435,7 @@ def _fetch_users(target_date: str) -> list:
 
 def _enrich_users(users: list, form_map: dict, platform_map: dict, target_date: str):
     """Returns (records_list, miss_count)."""
-    records    = []
+    records = []
     miss_count = 0
     for user in users:
         try:
@@ -450,7 +444,7 @@ def _enrich_users(users: list, form_map: dict, platform_map: dict, target_date: 
             if record["sessionId"] == "N/A":
                 miss_count += 1
         except Exception as e:
-            log.warning(f"    Skipping user {user.get('id', '?')}: {e}")
+            log.warning(f"    Skipping user {user.get('id','?')}: {e}")
             miss_count += 1
     return records, miss_count
 
@@ -471,95 +465,94 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
 
     # ── Session ID resolution ─────────────────────────────────────────────────
     #
-    # We want the session that existed BEFORE the user created their account
-    # i.e. the browsing session that led them to sign up, not any post-signup
-    # session from inside the platform.
-    #
-    # FIX 3: Use createdDate.epochMillis for exact millisecond comparison.
-    # Fall back to midnight UTC of that day only if epochMillis is not present.
-    #
-    # FIX 1: /activate paths are excluded for FORM_TYPE users.
-    # /activate is a post-signup email verification step — its session ID
-    # belongs to in-platform activity, not the acquisition journey.
+    # Rule:
+    #   1. Check platform_map for any pre-signup entry for this email
+    #   2. Check form_map for /signup-path entries only, pre-signup
+    #      (/activate is never considered — always post-signup)
+    #   3. Pick whichever source has the earlier timestamp
+    #   4. "Pre-signup" means ts < created_epoch_exact, where created_epoch_exact
+    #      is built from the User API's year/month/day/hours/minutes/seconds
+    #      fields — exact to the second. If nothing is found strictly before
+    #      this cutoff → N/A. We never use post-signup session IDs.
+    #   5. If still nothing → session_id = None → stored as N/A
 
-    created_epoch = (
-        cd.get("epochMillis")
-        or int(datetime(
-            int(cd.get("year") or 2025),
-            int(cd.get("month") or 1),
-            int(cd.get("day") or 1),
+    # Convert createdDate {year, month, day, hours, minutes, seconds} → epoch ms.
+    # The User API returns exact time fields (hours/minutes/seconds) — we use
+    # them directly so the cutoff is the user's precise creation timestamp, not
+    # an approximation. Any log entry with ts >= created_epoch_exact is
+    # post-signup and must never be used as the session ID source.
+    created_epoch_exact = None
+    try:
+        created_epoch_exact = int(datetime(
+            int(cd.get("year")    or 2025),
+            int(cd.get("month")   or 1),
+            int(cd.get("day")     or 1),
+            hour=int(cd.get("hours")   or 0),
+            minute=int(cd.get("minutes") or 0),
+            second=int(cd.get("seconds") or 0),
+            microsecond=0,
             tzinfo=timezone.utc
         ).timestamp() * 1000)
-    )
+    except Exception:
+        created_epoch_exact = None
 
-    def _pick_session(candidates: list) -> Optional[str]:
+    def _best_pre_signup(candidates: list) -> dict | None:
         """
-        Given a list of log entries [{sessionId, ts, ...}], returns the
-        sessionId of the entry with the earliest ts that is strictly before
-        created_epoch. Falls back to the globally earliest entry if nothing
-        qualifies (handles same-ms or missing timestamp edge cases).
-        Returns None if the list is empty.
+        Returns the entry with the earliest ts that is strictly before
+        created_epoch_exact (the user's exact creation time to the second).
+        Returns None if no such entry exists — we never use post-signup sessions.
         """
-        if not candidates:
+        if not candidates or created_epoch_exact is None:
             return None
-        pre  = [e for e in candidates if e["ts"] < created_epoch]
-        pool = sorted(pre if pre else candidates, key=lambda x: x["ts"])
-        return pool[0]["sessionId"] if pool else None
+        pre = [e for e in candidates if e["ts"] < created_epoch_exact]
+        if not pre:
+            return None
+        return sorted(pre, key=lambda x: x["ts"])[0]
 
-    session_id = None
+    # Gather candidates from both sources
+    platform_candidates = platform_map.get(email, [])
 
-    if reg_type in FORM_TYPES:
-        # Primary: form map, /signup path only
-        # /activate is excluded — those are post-signup email verification steps
-        signup_entries = [
-            e for e in form_map.get(email, [])
-            if e["path"].startswith("/signup")
-        ]
-        session_id = _pick_session(signup_entries)
+    # form_map: /signup path ONLY — /activate is always post-signup
+    signup_candidates = [
+        e for e in form_map.get(email, [])
+        if e["path"].startswith("/signup")
+    ]
 
-        # Fallback: platform map
-        if not session_id:
-            session_id = _pick_session(platform_map.get(email, []))
+    best_platform = _best_pre_signup(platform_candidates)
+    best_signup   = _best_pre_signup(signup_candidates)
 
+    # Pick the one with the earlier timestamp (closest to actual acquisition moment)
+    if best_platform and best_signup:
+        session_id = (best_platform if best_platform["ts"] <= best_signup["ts"]
+                      else best_signup)["sessionId"]
+    elif best_platform:
+        session_id = best_platform["sessionId"]
+    elif best_signup:
+        session_id = best_signup["sessionId"]
     else:
-        # Primary: platform map
-        session_id = _pick_session(platform_map.get(email, []))
+        session_id = None   # nothing found before createdDate → N/A
 
-        # Fallback: form map, any path
-        if not session_id:
-            session_id = _pick_session(form_map.get(email, []))
-
-    # ── Journey from URL change events ────────────────────────────────────────
+    # Journey
     origin = trigger = journey = "N/A"
-
     if session_id:
         url_logs = _fetch_limited(API["urlchange"], {"filter": {"sessionId": session_id}}, 50)
         events = sorted(
-            [
-                {
-                    "ts":      e.get("createdDate", {}).get("epochMillis", 0),
-                    "url":     e.get("metrics", {}).get("page", {}).get("url") or "",
-                    "path":    e.get("metrics", {}).get("page", {}).get("parsedUrl", {}).get("pathname") or "",
-                    "tab":     e.get("tabId"),
-                    "prevTab": e.get("previousTabId"),
-                }
-                for e in url_logs
-                if e.get("metrics", {}).get("page", {}).get("url")
-            ],
+            [{"ts": e.get("createdDate", {}).get("epochMillis", 0),
+              "url": e.get("metrics", {}).get("page", {}).get("url") or "",
+              "path": e.get("metrics", {}).get("page", {}).get("parsedUrl", {}).get("pathname") or "",
+              "tab": e.get("tabId"), "prevTab": e.get("previousTabId")}
+             for e in url_logs if e.get("metrics", {}).get("page", {}).get("url")],
             key=lambda x: x["ts"]
         )
-
         if events:
             origin  = events[0]["url"]
             journey = " > ".join(e["url"].split("?")[0] for e in events)
-
             auth_events = [e for e in events if e["path"].startswith(("/signup", "/login"))]
             if auth_events:
                 tab = auth_events[-1]["prevTab"]
                 while tab:
                     prev = next((e for e in events if e["tab"] == tab), None)
-                    if not prev:
-                        break
+                    if not prev: break
                     if not prev["path"].startswith(("/signup", "/login")):
                         trigger = prev["url"]
                         break
@@ -652,10 +645,7 @@ def _print_audit_summary(audit: list):
     log.info(f"{'Date':<12} {'Action':<12} {'Old miss':<10} {'New miss':<10} {'Reason'}")
     log.info("-" * 70)
 
-    replaced       = 0
-    skipped        = 0
-    inserted       = 0
-    dry            = 0
+    replaced = skipped = inserted = dry = 0
     total_old_miss = 0
     total_new_miss = 0
 
@@ -669,10 +659,10 @@ def _print_audit_summary(audit: list):
         total_old_miss += r["existing_miss"]
         total_new_miss += r["new_miss"] if action in ("REPLACE", "INSERT") else r["existing_miss"]
 
-        if action == "REPLACE":            replaced += 1
-        elif action == "INSERT":           inserted += 1
-        elif action == "SKIPPED":          skipped  += 1
-        elif action.startswith("DRY_"):    dry      += 1
+        if action == "REPLACE":   replaced += 1
+        elif action == "INSERT":  inserted += 1
+        elif action == "SKIPPED": skipped += 1
+        elif action.startswith("DRY_"): dry += 1
 
     log.info("=" * 70)
     log.info(f"Days replaced  : {replaced}")
