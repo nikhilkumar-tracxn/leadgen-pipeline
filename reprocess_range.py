@@ -139,8 +139,6 @@ SLEEP_S     = 0.3
 BATCH_SIZE  = 30
 MAX_RETRIES = 3
 
-# ── Timezone setup (IST) to resolve TS:0 issue ────────────────────────────────
-IST = timezone(timedelta(hours=5, minutes=30))
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
@@ -408,23 +406,7 @@ def _fetch_platform_logs(start: datetime, end: datetime) -> dict:
     for r in records:
         email = (r.get("requestor", {}).get("userEmail") or "").lower()
         sid   = r.get("requestor", {}).get("sessionId") or ""
-        
-        # ── TS:0 FIX ──────────────────────────────────────────────────────────
-        # Reconstruct the exact epoch ms using IST from the broken-out date object
-        cd = r.get("createdDate") or {}
-        ts = (
-            cd.get("epochMillis")
-            or int(datetime(
-                int(cd.get("year") or 1970),
-                int(cd.get("month") or 1),
-                int(cd.get("day") or 1),
-                int(cd.get("hours") or 0),
-                int(cd.get("minutes") or 0),
-                int(cd.get("seconds") or 0),
-                tzinfo=IST
-            ).timestamp() * 1000)
-        )
-        
+        ts    = r.get("createdDate", {}).get("epochMillis", 0)
         if email and sid:
             result.setdefault(email, []).append({"sessionId": sid, "ts": ts})
     log.info(f"    platform map: {len(records)} entries, {len(result)} unique emails")
@@ -434,8 +416,7 @@ def _fetch_platform_logs(start: datetime, end: datetime) -> dict:
 def _fetch_form_logs(start: datetime, end: datetime) -> dict:
     def fmt(dt, end_of_day):
         d = dt.replace(hour=23, minute=59, second=59) if end_of_day else dt.replace(hour=0, minute=0, second=0)
-        # ── IST Boundary Fix ──────────────────────────────────────────────────
-        return d.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+        return d.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
     payload = {"filter": {"createdDate": {"min": fmt(start, False), "max": fmt(end, True)}}}
     records = _fetch_all(API["form"], payload, "form")
@@ -501,24 +482,17 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
     # /activate is a post-signup email verification step — its session ID
     # belongs to in-platform activity, not the acquisition journey.
 
-    # ── IST Evaluation Math ───────────────────────────────────────────────────
     created_epoch = (
         cd.get("epochMillis")
         or int(datetime(
             int(cd.get("year") or 2025),
             int(cd.get("month") or 1),
             int(cd.get("day") or 1),
-            int(cd.get("hours") or 0),
-            int(cd.get("minutes") or 0),
-            int(cd.get("seconds") or 0),
-            tzinfo=IST
+            tzinfo=timezone.utc
         ).timestamp() * 1000)
     )
 
-    # ── Trace Logging Enabled ─────────────────────────────────────────────────
-    print(f"\n[TRACE] User: {email} | Reg Type: {reg_type} | Created Epoch: {created_epoch}")
-
-    def _pick_session(candidates: list, pool_name: str) -> Optional[str]:
+    def _pick_session(candidates: list) -> Optional[str]:
         """
         Given a list of log entries [{sessionId, ts, ...}], returns the
         sessionId of the entry with the earliest ts that is strictly before
@@ -527,61 +501,33 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
         Returns None if the list is empty.
         """
         if not candidates:
-            print(f"  [{pool_name}] Candidates: 0 -> None")
             return None
-            
         pre  = [e for e in candidates if e["ts"] < created_epoch]
         pool = sorted(pre if pre else candidates, key=lambda x: x["ts"])
-        
-        print(f"  [{pool_name}] Candidates total: {len(candidates)}")
-        print(f"  [{pool_name}] Before epoch (< {created_epoch}): {len(pre)}")
-        for idx, c in enumerate(candidates):
-            mark = "< (PRE)" if c["ts"] < created_epoch else ">= (POST)"
-            print(f"    - Entry {idx+1}: {c['sessionId']} | TS: {c['ts']} {mark} | Diff: {c['ts'] - created_epoch}ms")
-            
-        fallback = " (FALLBACK APPLIED)" if not pre else ""
-        selected = pool[0]["sessionId"] if pool else None
-        print(f"  [{pool_name}] Selected: {selected}{fallback}")
-        
-        return selected
+        return pool[0]["sessionId"] if pool else None
 
     session_id = None
 
     if reg_type in FORM_TYPES:
-        print("  Path: FORM_TYPES Logic")
-        
         # Primary: form map, /signup path only
         # /activate is excluded — those are post-signup email verification steps
         signup_entries = [
             e for e in form_map.get(email, [])
             if e["path"].startswith("/signup")
         ]
-        
-        if form_map.get(email):
-            print(f"  Form map has {len(form_map.get(email, []))} raw entries.")
-            print(f"  After '/signup' filter: {len(signup_entries)} entries.")
-            for e in form_map.get(email, []):
-                print(f"    - path: {e.get('path')} | sid: {e.get('sessionId')}")
-                
-        session_id = _pick_session(signup_entries, "Form Map Primary")
+        session_id = _pick_session(signup_entries)
 
         # Fallback: platform map
         if not session_id:
-            print("  Falling back to Platform Map")
-            session_id = _pick_session(platform_map.get(email, []), "Platform Map Fallback")
+            session_id = _pick_session(platform_map.get(email, []))
 
     else:
-        print("  Path: NON-FORM_TYPES Logic")
-        
         # Primary: platform map
-        session_id = _pick_session(platform_map.get(email, []), "Platform Map Primary")
+        session_id = _pick_session(platform_map.get(email, []))
 
         # Fallback: form map, any path
         if not session_id:
-            print("  Falling back to Form Map")
-            session_id = _pick_session(form_map.get(email, []), "Form Map Fallback")
-
-    print(f"  FINAL SESSION ID: {session_id}\n")
+            session_id = _pick_session(form_map.get(email, []))
 
     # ── Journey from URL change events ────────────────────────────────────────
     origin = trigger = journey = "N/A"
@@ -690,8 +636,7 @@ def _clean(value: Optional[str], is_journey: bool = False) -> str:
 
 def _parse_date(date_str: str) -> datetime:
     try:
-        # ── IST Boundary Fix ──────────────────────────────────────────────────
-        return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=IST)
+        return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError:
         raise ValueError(f"Invalid date '{date_str}' — use YYYY-MM-DD")
 
