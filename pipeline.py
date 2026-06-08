@@ -1,41 +1,92 @@
 """
 ================================================================================
-Leadgen BigQuery Upload Pipeline
+Leadgen BigQuery Upload Pipeline  —  pipeline.py
 ================================================================================
 
-FIXES vs previous version (session ID miss rate ~25% → ~1%)
-------------------------------------------------------------
-FIX 1 — Wider log window
-  Old: log_start = target - 1 day,  log_end = target + 1 day  (2-day window)
-  New: log_start = target - 3 days, log_end = target + 1 day  (4-day window)
+PURPOSE
+-------
+Daily ingest pipeline. Runs automatically every day at 6:00 AM IST to fetch
+all users who signed up the previous day from the Tracxn API, enrich them with
+session ID and journey data, and append them to the main BigQuery table.
 
-  Why: Apps Script used twoDaysAgo → today (3 days). A user may have started
-  a browsing session up to 3 days before actually signing up. The old Python
-  window was too narrow and missed those platform/form log entries entirely,
-  causing ~25% of session IDs to be unfindable.
+HOW IT WORKS
+------------
+For each run:
 
-FIX 2 — Cross-source session ID fallback
-  Old: FORM_TYPES → form map only.  Others → platform map only.
-  New: FORM_TYPES → try form map first, then platform map as fallback.
-       Others    → try platform map first, then form map as fallback.
+  Step 1 — Fetch platform request logs for the log window
+           Builds: {email → [{sessionId, ts}]}
 
-  Why: In practice some FORM_TYPE users also have platform log entries (e.g.
-  they used the API before switching to web signup). The fallback catches these.
+  Step 2 — Fetch form submission logs for the log window
+           Builds: {email → [{sessionId, ts, path}]}
 
-FIX 3 — Broader /signup path matching
-  Old: path must be exactly "/signup"
-  New: path must START WITH "/signup" (catches "/signup?ref=..." variants)
+  Step 3 — Fetch all users created on the target date
 
-FIX 4 — Diagnostic logging
-  Session ID hit/miss stats are now logged at the end of Step 4 so you can
-  see the miss rate in every run without inspecting individual records.
+  Step 4 — For each user, resolve session ID and build enriched record
+           Session ID logic: see _pick_session / build_user_record below
+
+  Step 5 — Upload enriched records to BigQuery (WRITE_APPEND)
+
+SESSION ID LOGIC
+----------------
+We want the session ID that existed BEFORE the user created their account —
+i.e. the browsing session that led them to sign up, not any post-signup
+in-platform session.
+
+  created_epoch: read from createdDate.epochMillis (exact ms from API).
+                 Falls back to midnight UTC of that day if epochMillis absent.
+
+  _pick_session(candidates):
+    1. Filter to entries where ts < created_epoch (strictly before signup)
+    2. From those, pick the one with the earliest timestamp
+    3. If nothing qualifies (all entries are post-signup), fall back to the
+       globally earliest entry across all candidates
+    4. Return None if candidates is empty
+
+  Registration type determines which source is checked first:
+
+    FORM_TYPES (OTP_SIGNUP, THIRD_PARTY_SIGNUP, THIRD_PARTY_SIGNUP_GOOGLE,
+                THIRD_PARTY_SIGNUP_MICROSOFT, THIRD_PARTY_SIGNUP_ENTRA_ID):
+      Primary  → form map, /signup paths only (/activate excluded)
+      Fallback → platform map (any path)
+
+    All other types:
+      Primary  → platform map
+      Fallback → form map (any path)
+
+  /activate is ALWAYS excluded from form map lookups for FORM_TYPES.
+  /activate is a post-signup email verification step — its session ID
+  belongs to in-platform activity, not the acquisition journey.
+
+LOG WINDOW
+----------
+  log_start = target_date - 1 day
+  log_end   = target_date + 1 day
+
+  A ±1-day window is used to catch sessions that started just before midnight
+  or log entries recorded slightly after midnight of the target date.
 
 RUN MODES
 ---------
-  production        Auto: yesterday → Main table   (used by scheduled runs)
-  production_manual Specific date  → Main table   (backfill)
-  test_auto         Auto: yesterday → Backup table
-  test_manual       Specific date  → Backup table
+  production        Auto: yesterday → Main table   (scheduled runs)
+  production_manual Specific date  → Main table   (backfill a missed date)
+  test_auto         Auto: yesterday → Backup table (smoke test)
+  test_manual       Specific date  → Backup table (test a historical date)
+
+ENVIRONMENT VARIABLES
+---------------------
+  Required secrets:
+    TRACXN_ACCESS_TOKEN
+    GCP_PROJECT_ID
+    GCP_SA_KEY              Full GCP service account key JSON
+
+  Required config:
+    BQ_DATASET              (defaults to leadgen_dataset)
+    BQ_TABLE                Main production table name
+    BQ_TABLE_BACKUP         Backup table name (test modes)
+
+  Runtime:
+    MODE                    One of the four run modes above
+    TEST_DATE               YYYY-MM-DD, required for *_manual modes
 ================================================================================
 """
 
@@ -64,8 +115,8 @@ PROJECT_ID       = os.environ["GCP_PROJECT_ID"]
 DATASET          = os.environ.get("BQ_DATASET", "leadgen_dataset")
 GCP_SA_JSON      = os.environ["GCP_SA_KEY"]
 MODE             = os.environ.get("MODE", "production").lower()
-TABLE_PRODUCTION = os.environ.get("BQ_TABLE",       "leadgen_users_v2_no_partition")
-TABLE_BACKUP     = os.environ.get("BQ_TABLE_BACKUP", "leadgen_users_v2_no_partition_backup3")
+TABLE_PRODUCTION = os.environ.get("BQ_TABLE",        "leadgen_users_v2_no_partition")
+TABLE_BACKUP     = os.environ.get("BQ_TABLE_BACKUP",  "leadgen_users_v2_no_partition_backup3")
 TEST_DATE_INPUT  = os.environ.get("TEST_DATE", "").strip()
 
 HEADERS = {
@@ -81,16 +132,14 @@ API = {
     "urlchange": "https://platform.tracxn.com/api/2.2/logs/frontend/urlchange",
 }
 
+# Registration types that use the web signup form (checked against form map first)
 FORM_TYPES = {
-    "OTP_SIGNUP",
-    "THIRD_PARTY_SIGNUP",
-    "THIRD_PARTY_SIGNUP_GOOGLE",
-    "THIRD_PARTY_SIGNUP_MICROSOFT",
-    "THIRD_PARTY_SIGNUP_ENTRA_ID",
+    "OTP_SIGNUP", "THIRD_PARTY_SIGNUP", "THIRD_PARTY_SIGNUP_GOOGLE",
+    "THIRD_PARTY_SIGNUP_MICROSOFT", "THIRD_PARTY_SIGNUP_ENTRA_ID",
 }
 
-# FIX 1: wider log window — 3 days before target (matching Apps Script behaviour)
-LOG_WINDOW_DAYS_BEFORE = 3
+# Log window: ±1 day around the target date
+LOG_WINDOW_DAYS_BEFORE = 1
 LOG_WINDOW_DAYS_AFTER  = 1
 
 SLEEP_S     = 0.3
@@ -130,7 +179,6 @@ def main():
         table = TABLE_PRODUCTION
         log.info("PRODUCTION AUTO — writing to MAIN table")
 
-    # FIX 1: wider log window matches Apps Script (3 days before target)
     log_start = target_dt - timedelta(days=LOG_WINDOW_DAYS_BEFORE)
     log_end   = target_dt + timedelta(days=LOG_WINDOW_DAYS_AFTER)
 
@@ -166,7 +214,7 @@ def main():
 # ════════════════════════════════════════════════════════════════════════════════
 def step1_fetch_platform_logs(start: datetime, end: datetime) -> dict:
     """
-    Fetches platform request logs for the full window.
+    Fetches platform request logs for the full log window.
     Filter format: epoch milliseconds.
     Returns: {email → [{sessionId, ts}]}
     """
@@ -187,7 +235,7 @@ def step1_fetch_platform_logs(start: datetime, end: datetime) -> dict:
         email = (r.get("requestor", {}).get("userEmail") or "").lower()
         sid   = r.get("requestor", {}).get("sessionId") or ""
         ts    = r.get("createdDate", {}).get("epochMillis", 0)
-        if email and sid:           # only store entries that have a valid session ID
+        if email and sid:
             result.setdefault(email, []).append({"sessionId": sid, "ts": ts})
 
     log.info(f"  → {len(result)} unique emails with session IDs in platform map")
@@ -199,7 +247,7 @@ def step1_fetch_platform_logs(start: datetime, end: datetime) -> dict:
 # ════════════════════════════════════════════════════════════════════════════════
 def step2_fetch_form_logs(start: datetime, end: datetime) -> dict:
     """
-    Fetches form submission logs for the full window.
+    Fetches form submission logs for the full log window.
     Filter format: ISO 8601 with +00:00 UTC offset.
     Returns: {email → [{sessionId, ts, path}]}
     """
@@ -224,7 +272,7 @@ def step2_fetch_form_logs(start: datetime, end: datetime) -> dict:
         sid   = r.get("sessionId") or ""
         ts    = r.get("createdDate", {}).get("epochMillis", 0)
         path  = r.get("metrics", {}).get("page", {}).get("parsedUrl", {}).get("pathname") or ""
-        if email and sid:           # only store entries that have a valid session ID
+        if email and sid:
             result.setdefault(email, []).append({"sessionId": sid, "ts": ts, "path": path})
 
     log.info(f"  → {len(result)} unique emails with session IDs in form map")
@@ -237,7 +285,7 @@ def step2_fetch_form_logs(start: datetime, end: datetime) -> dict:
 def step3_fetch_users(target_date: str) -> list:
     """
     Fetches all users created on the target date.
-    Filter format: DD/MM/YYYY.
+    Filter format: DD/MM/YYYY (Tracxn user API expects this format).
     """
     log.info(f"STEP 3: Fetching users for {target_date}...")
     payload = {"filter": {"createdDate": {"min": target_date, "max": target_date}}}
@@ -251,13 +299,13 @@ def step3_fetch_users(target_date: str) -> list:
 # ════════════════════════════════════════════════════════════════════════════════
 def step4_enrich_users(users: list, form_map: dict, platform_map: dict, target_date: str) -> list:
     log.info(f"STEP 4: Enriching {len(users)} users...")
-    records = []
-    session_found = 0
+    records         = []
+    session_found   = 0
     session_missing = 0
 
     for i, user in enumerate(users, 1):
         if i % 50 == 0:
-            log.info(f"  Processed {i}/{len(users)}  (session hits so far: {session_found}, misses: {session_missing})")
+            log.info(f"  Processed {i}/{len(users)}  (session hits: {session_found}, misses: {session_missing})")
         try:
             record = build_user_record(user, form_map, platform_map, target_date)
             records.append(record)
@@ -269,7 +317,7 @@ def step4_enrich_users(users: list, form_map: dict, platform_map: dict, target_d
             log.warning(f"  Skipping user {user.get('id', '?')}: {e}")
             session_missing += 1
 
-    total = session_found + session_missing
+    total    = session_found + session_missing
     miss_pct = (session_missing / total * 100) if total else 0
     log.info(f"  → Session ID stats: {session_found} found, {session_missing} missing ({miss_pct:.1f}% miss rate)")
     log.info(f"  → {len(records)} records ready for upload")
@@ -278,15 +326,16 @@ def step4_enrich_users(users: list, form_map: dict, platform_map: dict, target_d
 
 def build_user_record(user: dict, form_map: dict, platform_map: dict, target_date: str) -> dict:
     """
-    Builds one enriched record.
+    Builds one enriched BigQuery record for a single user.
 
-    FIX 2 — Cross-source fallback:
-      FORM_TYPES → try form_map (/signup entries) FIRST, then platform_map
-      Others     → try platform_map FIRST, then form_map
-
-    FIX 3 — Broader path match:
-      path.startswith("/signup") instead of path == "/signup"
-      catches "/signup?ref=google" and other variants
+    Session ID resolution:
+      - Use createdDate.epochMillis from the API for exact ms comparison.
+        Falls back to midnight UTC of the created day if epochMillis absent.
+      - _pick_session picks the earliest log entry whose ts < created_epoch.
+        If nothing qualifies, falls back to the globally earliest entry.
+      - FORM_TYPES: check form map (/signup paths only) first, then platform.
+      - Other types: check platform map first, then form map (any path).
+      - /activate paths are never used — post-signup email verification only.
     """
     email    = (user.get("email") or "").lower()
     reg_type = user.get("registrationType") or ""
@@ -301,39 +350,57 @@ def build_user_record(user: dict, form_map: dict, platform_map: dict, target_dat
         int(cd.get("day") or 1),
     )
 
-    # ── FIX 2: Session ID with cross-source fallback ───────────────────────
+    # ── created_epoch: exact ms timestamp of signup ───────────────────────────
+    # Prefer epochMillis from the API (exact second of signup).
+    # Fall back to midnight UTC of that day if not present.
+    created_epoch = (
+        cd.get("epochMillis")
+        or int(datetime(
+            int(cd.get("year") or 2025),
+            int(cd.get("month") or 1),
+            int(cd.get("day") or 1),
+            tzinfo=timezone.utc,
+        ).timestamp() * 1000)
+    )
+
+    def _pick_session(candidates: list) -> Optional[str]:
+        """
+        From a list of log entries [{sessionId, ts, ...}], returns the sessionId
+        of the entry with the earliest ts that is strictly before created_epoch.
+        If no entry qualifies (all post-signup), falls back to the globally
+        earliest entry. Returns None if candidates is empty.
+        """
+        if not candidates:
+            return None
+        pre  = [e for e in candidates if e["ts"] < created_epoch]
+        pool = sorted(pre if pre else candidates, key=lambda x: x["ts"])
+        return pool[0]["sessionId"] if pool else None
+
+    # ── Session ID lookup: branched by registration type ─────────────────────
     session_id = None
 
     if reg_type in FORM_TYPES:
-        # Primary: form map, /signup path (FIX 3: startswith, not ==)
-        entries = sorted(
-            [e for e in form_map.get(email, []) if e["path"].startswith("/signup")],
-            key=lambda x: x["ts"]
-        )
-        if entries:
-            session_id = entries[0]["sessionId"]
+        # Primary: form map, /signup paths only.
+        # /activate is excluded — it is a post-signup email verification step.
+        signup_entries = [
+            e for e in form_map.get(email, [])
+            if e["path"].startswith("/signup")
+        ]
+        session_id = _pick_session(signup_entries)
 
-        # Fallback: platform map (catches users who hit API before web signup)
+        # Fallback: platform map (any entry)
         if not session_id:
-            fallback = sorted(platform_map.get(email, []), key=lambda x: x["ts"])
-            if fallback:
-                session_id = fallback[0]["sessionId"]
-                log.debug(f"  {email}: used platform map fallback (reg_type={reg_type})")
+            session_id = _pick_session(platform_map.get(email, []))
 
     else:
         # Primary: platform map
-        entries = sorted(platform_map.get(email, []), key=lambda x: x["ts"])
-        if entries:
-            session_id = entries[0]["sessionId"]
+        session_id = _pick_session(platform_map.get(email, []))
 
-        # Fallback: form map (any path, not just /signup)
+        # Fallback: form map (any path — not restricted to /signup)
         if not session_id:
-            fallback = sorted(form_map.get(email, []), key=lambda x: x["ts"])
-            if fallback:
-                session_id = fallback[0]["sessionId"]
-                log.debug(f"  {email}: used form map fallback (reg_type={reg_type})")
+            session_id = _pick_session(form_map.get(email, []))
 
-    # ── Journey from URL change events ────────────────────────────────────
+    # ── Journey from URL change events ────────────────────────────────────────
     origin = trigger = journey = "N/A"
 
     if session_id:
@@ -350,7 +417,7 @@ def build_user_record(user: dict, form_map: dict, platform_map: dict, target_dat
                 for e in url_logs
                 if e.get("metrics", {}).get("page", {}).get("url")
             ],
-            key=lambda x: x["ts"]
+            key=lambda x: x["ts"],
         )
 
         if events:
@@ -396,7 +463,7 @@ def step5_upload_to_bigquery(records: list, table: str):
 
     creds = service_account.Credentials.from_service_account_info(
         json.loads(GCP_SA_JSON),
-        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
     client    = bigquery.Client(project=PROJECT_ID, credentials=creds)
     table_ref = f"{PROJECT_ID}.{DATASET}.{table}"
@@ -430,6 +497,7 @@ def step5_upload_to_bigquery(records: list, table: str):
 # SHARED HELPERS
 # ════════════════════════════════════════════════════════════════════════════════
 def fetch_all(endpoint: str, payload: dict, name: str) -> list:
+    """Paginates through all results from an endpoint using size+from."""
     results = []
     payload = {**payload, "size": BATCH_SIZE, "from": 0}
     log.info(f"  [{name}] payload: {json.dumps(payload)}")
@@ -446,6 +514,7 @@ def fetch_all(endpoint: str, payload: dict, name: str) -> list:
 
 
 def fetch_limited(endpoint: str, payload: dict, max_records: int) -> list:
+    """Fetches one page of up to max_records results (no pagination)."""
     payload = {**payload, "size": min(BATCH_SIZE, max_records), "from": 0}
     batch, _ = _post(endpoint, payload, "urlchange")
     return (batch or [])[:max_records]
@@ -481,7 +550,7 @@ def clean(value: Optional[str], is_journey: bool = False) -> str:
 
 def _yesterday() -> datetime:
     return (datetime.now(timezone.utc) - timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
+        hour=0, minute=0, second=0, microsecond=0,
     )
 
 
