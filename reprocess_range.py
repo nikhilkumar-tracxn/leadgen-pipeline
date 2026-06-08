@@ -1,3 +1,21 @@
+You are entirely right to challenge my reasoning. The discrepancy you identified proves there was a fundamental logic flaw in how my previous response interacted with your logs, and my explanation regarding the `/urlchange` API was a hallucination that failed to address the core issue.
+
+Let's look at the facts:
+
+1. **The API Bottleneck:** The initial fetching of `platformrequests`, `formsubmit`, and `users` takes several minutes because they paginate through thousands of records using `size: 30` and a `0.3s` sleep between requests.
+2. **The Processing Time:** Once those arrays are in memory, the actual `_enrich_users` loop (which does the dictionary lookups and timestamp comparisons) executes in mere seconds because it's purely CPU-bound on pre-fetched data.
+
+The reason your previous run finished so fast and only updated ~100 users is almost certainly because the initial API fetch was interrupted, failed silently, or returned a truncated dataset (e.g., an HTTP 504 Gateway Timeout or hitting a `max_records` limit that wasn't properly handled by the retry logic), meaning the `_enrich_users` loop ran against an empty or partial list of users.
+
+### Action Plan
+
+I am reverting to your **exact original `reprocess_range.py` code**. I will make absolutely **zero** changes to your session ID logic, your API fetching, or your timezone handling.
+
+I am *only* adding the deep trace logging you requested. I have added the `WATCH_EMAILS` matrix, and when the script processes those specific users, it will print a highly detailed breakdown of every session ID candidate it found, their timestamps, and exactly why the final ID was selected based on your original logic.
+
+Here is the updated original code with the logging injected:
+
+```python
 """
 ================================================================================
 Manual Reprocess Pipeline  —  reprocess_range.py
@@ -130,6 +148,18 @@ API = {
 FORM_TYPES = {
     "OTP_SIGNUP", "THIRD_PARTY_SIGNUP", "THIRD_PARTY_SIGNUP_GOOGLE",
     "THIRD_PARTY_SIGNUP_MICROSOFT", "THIRD_PARTY_SIGNUP_ENTRA_ID",
+}
+
+# ── Target Audit Matrix ───────────────────────────────────────────────────────
+WATCH_EMAILS = {
+    "connect@amplior.com",
+    "sachin@1729capital.com",
+    "rakshit.gairola@gopeoplematters.com",
+    "anurag@protectron.in",
+    "kona.sripooja@bba.christuniversity.in",
+    "m.sy@sylamtechgroup.com",
+    "vishal@prudenttec.com",
+    "lu@akool.com"
 }
 
 LOG_WINDOW_DAYS_BEFORE = 1
@@ -458,6 +488,9 @@ def _enrich_users(users: list, form_map: dict, platform_map: dict, target_date: 
 def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: str) -> dict:
     email    = (user.get("email") or "").lower()
     reg_type = user.get("registrationType") or ""
+    
+    # Enable logging exclusively for these emails
+    is_audit = email in WATCH_EMAILS
 
     cats = [c.get("userCategory") for c in (user.get("categoryList") or []) if c.get("userCategory")]
     user_category = ", ".join(cats) if cats else (user.get("userCategory") or "N/A")
@@ -492,7 +525,10 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
         ).timestamp() * 1000)
     )
 
-    def _pick_session(candidates: list) -> Optional[str]:
+    if is_audit:
+        print(f"\n[TRACE] User: {email} | Reg Type: {reg_type} | Created Epoch: {created_epoch}")
+
+    def _pick_session(candidates: list, pool_name: str) -> Optional[str]:
         """
         Given a list of log entries [{sessionId, ts, ...}], returns the
         sessionId of the entry with the earliest ts that is strictly before
@@ -501,9 +537,22 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
         Returns None if the list is empty.
         """
         if not candidates:
+            if is_audit:
+                print(f"  [{pool_name}] Candidates: 0 -> None")
             return None
+            
         pre  = [e for e in candidates if e["ts"] < created_epoch]
         pool = sorted(pre if pre else candidates, key=lambda x: x["ts"])
+        
+        if is_audit:
+            print(f"  [{pool_name}] Candidates total: {len(candidates)}")
+            print(f"  [{pool_name}] Before epoch (< {created_epoch}): {len(pre)}")
+            for idx, c in enumerate(candidates):
+                mark = "< (PRE)" if c["ts"] < created_epoch else ">= (POST)"
+                print(f"    - Entry {idx+1}: {c['sessionId']} | TS: {c['ts']} {mark} | Diff: {c['ts'] - created_epoch}ms")
+            fallback = " (FALLBACK APPLIED)" if not pre else ""
+            print(f"  [{pool_name}] Selected: {pool[0]['sessionId']}{fallback}")
+            
         return pool[0]["sessionId"] if pool else None
 
     session_id = None
@@ -511,23 +560,41 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
     if reg_type in FORM_TYPES:
         # Primary: form map, /signup path only
         # /activate is excluded — those are post-signup email verification steps
+        if is_audit:
+            print("  Path: FORM_TYPES Logic")
+            
         signup_entries = [
             e for e in form_map.get(email, [])
             if e["path"].startswith("/signup")
         ]
-        session_id = _pick_session(signup_entries)
+        
+        if is_audit and form_map.get(email):
+            print(f"  Form map has {len(form_map.get(email, []))} raw entries.")
+            print(f"  After '/signup' filter: {len(signup_entries)} entries.")
+            for e in form_map.get(email, []):
+                print(f"    - path: {e.get('path')} | sid: {e.get('sessionId')}")
+                
+        session_id = _pick_session(signup_entries, "Form Map Primary")
 
         # Fallback: platform map
         if not session_id:
-            session_id = _pick_session(platform_map.get(email, []))
+            if is_audit: print("  Falling back to Platform Map")
+            session_id = _pick_session(platform_map.get(email, []), "Platform Map Fallback")
 
     else:
+        if is_audit:
+            print("  Path: NON-FORM_TYPES Logic")
+            
         # Primary: platform map
-        session_id = _pick_session(platform_map.get(email, []))
+        session_id = _pick_session(platform_map.get(email, []), "Platform Map Primary")
 
         # Fallback: form map, any path
         if not session_id:
-            session_id = _pick_session(form_map.get(email, []))
+            if is_audit: print("  Falling back to Form Map")
+            session_id = _pick_session(form_map.get(email, []), "Form Map Fallback")
+
+    if is_audit:
+        print(f"  FINAL SESSION ID: {session_id}\n")
 
     # ── Journey from URL change events ────────────────────────────────────────
     origin = trigger = journey = "N/A"
@@ -685,3 +752,5 @@ def _print_audit_summary(audit: list):
 
 if __name__ == "__main__":
     main()
+
+```
