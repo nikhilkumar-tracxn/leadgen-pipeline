@@ -29,17 +29,14 @@ FIX 2 — Always replace, never skip
   Previously skipped days where new miss count >= existing miss count.
   Now always replaces with freshly processed data regardless of miss count.
 
-FIX 3 — Exact createdDate timestamp comparison
-  Previously compared against midnight UTC (day only). Now uses
-  createdDate.epochMillis from the API for exact millisecond comparison,
-  falling back to midnight UTC only if epochMillis is not available.
-  This ensures we correctly pick session IDs that occurred before the
-  exact moment the user signed up, not just before midnight of that day.
+FIX 3 — Exact createdDate timestamp comparison in IST
+  Uses exact hours, minutes, and seconds from the API response and converts 
+  them natively from IST to epoch milliseconds for accurate comparison against 
+  log events. Applied to both user logs and platform request logs.
 
-FIX 4 — Earliest session ID before signup
-  Among all valid session ID candidates, always picks the one with the
-  earliest timestamp that occurred before the user's createdDate.
-  Falls back to earliest overall only if nothing exists before createdDate.
+FIX 4 — Strict Pre-Signup Enforcement
+  Only accepts session IDs with timestamps strictly BEFORE the exact user 
+  creation time. If no such log exists, strictly assigns "N/A".
 
 SAFETY
 ------
@@ -50,36 +47,6 @@ SAFETY
 - A dry-run mode logs decisions without writing anything to BigQuery
 - Full audit log is printed at the end showing every day's outcome
 
-ENVIRONMENT VARIABLES
----------------------
-  Required secrets (same GitHub Secrets as pipeline.py):
-    TRACXN_ACCESS_TOKEN
-    GCP_PROJECT_ID
-    GCP_SA_KEY
-
-  Required config:
-    BQ_DATASET          (or defaults to leadgen_dataset)
-    BQ_TABLE            Target table (main production table)
-
-  Required for this script:
-    REPROCESS_START     Start date  YYYY-MM-DD  e.g. 2026-05-01
-    REPROCESS_END       End date    YYYY-MM-DD  e.g. 2026-05-31
-
-  Optional:
-    DRY_RUN             Set to "true" to log decisions without writing to BQ
-                        Useful to preview what would change before committing
-
-HOW TO RUN (GitHub Actions manual trigger)
-------------------------------------------
-  Set the workflow inputs:
-    reprocess_start: 2026-05-01
-    reprocess_end:   2026-05-31
-    dry_run:         false   (or true to preview first)
-
-SAFE TO RUN MULTIPLE TIMES
----------------------------
-Running on the same date range twice is safe. Each run always replaces
-with the latest freshly processed data.
 ================================================================================
 """
 
@@ -132,24 +99,15 @@ FORM_TYPES = {
     "THIRD_PARTY_SIGNUP_MICROSOFT", "THIRD_PARTY_SIGNUP_ENTRA_ID",
 }
 
-# ── Target Audit Matrix ───────────────────────────────────────────────────────
-WATCH_EMAILS = {
-    "connect@amplior.com",
-    "sachin@1729capital.com",
-    "rakshit.gairola@gopeoplematters.com",
-    "anurag@protectron.in",
-    "kona.sripooja@bba.christuniversity.in",
-    "m.sy@sylamtechgroup.com",
-    "vishal@prudenttec.com",
-    "lu@akool.com"
-}
-
 LOG_WINDOW_DAYS_BEFORE = 1
 LOG_WINDOW_DAYS_AFTER  = 1
 
 SLEEP_S     = 0.3
 BATCH_SIZE  = 30
 MAX_RETRIES = 3
+
+# ── Timezone setup (IST) ──────────────────────────────────────────────────────
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -173,6 +131,7 @@ def main():
     log.info(f"Date range  : {REPROCESS_START} → {REPROCESS_END}")
     log.info(f"Table       : {table_ref}")
     log.info(f"Dry run     : {DRY_RUN}")
+    log.info(f"Timezone    : IST (+05:30)")
     log.info(f"Log window  : {LOG_WINDOW_DAYS_BEFORE}d before + {LOG_WINDOW_DAYS_AFTER}d after each target date")
     log.info("=" * 70)
 
@@ -268,11 +227,9 @@ def _process_one_day(bq, table_ref, target_dt, date_str, date_api_str) -> dict:
     log.info(f"  D. Deciding...")
 
     if existing_stats["total"] == 0:
-        # No existing data — just insert
         decision = "INSERT"
         reason   = "No existing data for this date"
     else:
-        # Always replace with freshly processed data regardless of miss count
         decision = "REPLACE"
         reason   = (f"New miss count ({new_miss}) vs existing ({existing_stats['missing']}) "
                     f"— replacing with latest processed data")
@@ -301,10 +258,6 @@ def _process_one_day(bq, table_ref, target_dt, date_str, date_api_str) -> dict:
 # BIGQUERY OPERATIONS
 # ════════════════════════════════════════════════════════════════════════════════
 def _query_existing_miss_rate(bq, table_ref: str, date_str: str) -> dict:
-    """
-    Queries BigQuery for the current session ID miss rate for a specific date.
-    Returns: {total, missing, miss_pct}
-    """
     query = f"""
         SELECT
             COUNT(*) AS total,
@@ -323,15 +276,6 @@ def _query_existing_miss_rate(bq, table_ref: str, date_str: str) -> dict:
 
 
 def _atomic_replace_day(bq, table_ref: str, records: list, date_str: str):
-    """
-    Replaces all rows for date_str in table_ref with the new records.
-    Uses the atomic swap pattern — all other dates are untouched.
-
-    We use load_table_from_json with an explicit schema (not autodetect)
-    so that createdDate is correctly typed as DATE in the temp table.
-    autodetect would infer "2026-05-01" as STRING, causing the UNION ALL
-    to fail with "incompatible types: DATE, STRING".
-    """
     temp_id = f"{PROJECT_ID}.{DATASET}.temp_reprocess_{uuid.uuid4().hex[:8]}"
 
     schema = [
@@ -377,9 +321,6 @@ def _atomic_replace_day(bq, table_ref: str, records: list, date_str: str):
 
 
 def _insert_day(bq, table_ref: str, records: list):
-    """
-    Inserts records for a date that has no existing rows (simple append).
-    """
     schema = [
         bigquery.SchemaField("createdDate",       "DATE",   mode="NULLABLE"),
         bigquery.SchemaField("id",                "STRING", mode="NULLABLE"),
@@ -418,7 +359,23 @@ def _fetch_platform_logs(start: datetime, end: datetime) -> dict:
     for r in records:
         email = (r.get("requestor", {}).get("userEmail") or "").lower()
         sid   = r.get("requestor", {}).get("sessionId") or ""
-        ts    = r.get("createdDate", {}).get("epochMillis", 0)
+        
+        # FIX: Parse exact epoch milliseconds using IST object translation 
+        # to handle cases where epochMillis is missing from platform logs
+        cd = r.get("createdDate") or {}
+        ts = (
+            cd.get("epochMillis")
+            or int(datetime(
+                int(cd.get("year") or 1970),
+                int(cd.get("month") or 1),
+                int(cd.get("day") or 1),
+                int(cd.get("hours") or 0),
+                int(cd.get("minutes") or 0),
+                int(cd.get("seconds") or 0),
+                tzinfo=IST
+            ).timestamp() * 1000)
+        )
+
         if email and sid:
             result.setdefault(email, []).append({"sessionId": sid, "ts": ts})
     log.info(f"    platform map: {len(records)} entries, {len(result)} unique emails")
@@ -428,7 +385,8 @@ def _fetch_platform_logs(start: datetime, end: datetime) -> dict:
 def _fetch_form_logs(start: datetime, end: datetime) -> dict:
     def fmt(dt, end_of_day):
         d = dt.replace(hour=23, minute=59, second=59) if end_of_day else dt.replace(hour=0, minute=0, second=0)
-        return d.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        # FIX: Ensure accurate boundary passing for form logs using IST standard
+        return d.strftime("%Y-%m-%dT%H:%M:%S+05:30")
 
     payload = {"filter": {"createdDate": {"min": fmt(start, False), "max": fmt(end, True)}}}
     records = _fetch_all(API["form"], payload, "form")
@@ -471,8 +429,8 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
     email    = (user.get("email") or "").lower()
     reg_type = user.get("registrationType") or ""
     
-    # Enable logging exclusively for these emails
-    is_audit = email in WATCH_EMAILS
+    # Enabled trace logging globally for every user
+    is_audit = True 
 
     cats = [c.get("userCategory") for c in (user.get("categoryList") or []) if c.get("userCategory")]
     user_category = ", ".join(cats) if cats else (user.get("userCategory") or "N/A")
@@ -485,25 +443,17 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
     )
 
     # ── Session ID resolution ─────────────────────────────────────────────────
-    #
-    # We want the session that existed BEFORE the user created their account
-    # i.e. the browsing session that led them to sign up, not any post-signup
-    # session from inside the platform.
-    #
-    # FIX 3: Use createdDate.epochMillis for exact millisecond comparison.
-    # Fall back to midnight UTC of that day only if epochMillis is not present.
-    #
-    # FIX 1: /activate paths are excluded for FORM_TYPE users.
-    # /activate is a post-signup email verification step — its session ID
-    # belongs to in-platform activity, not the acquisition journey.
-
+    # Uses exact hours, minutes, and seconds from the API response natively in IST.
     created_epoch = (
         cd.get("epochMillis")
         or int(datetime(
             int(cd.get("year") or 2025),
             int(cd.get("month") or 1),
             int(cd.get("day") or 1),
-            tzinfo=timezone.utc
+            int(cd.get("hours") or 0),
+            int(cd.get("minutes") or 0),
+            int(cd.get("seconds") or 0),
+            tzinfo=IST
         ).timestamp() * 1000)
     )
 
@@ -511,20 +461,22 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
         print(f"\n[TRACE] User: {email} | Reg Type: {reg_type} | Created Epoch: {created_epoch}")
 
     def _pick_session(candidates: list, pool_name: str) -> Optional[str]:
-        """
-        Given a list of log entries [{sessionId, ts, ...}], returns the
-        sessionId of the entry with the earliest ts that is strictly before
-        created_epoch. Falls back to the globally earliest entry if nothing
-        qualifies (handles same-ms or missing timestamp edge cases).
-        Returns None if the list is empty.
-        """
         if not candidates:
             if is_audit:
                 print(f"  [{pool_name}] Candidates: 0 -> None")
             return None
             
-        pre  = [e for e in candidates if e["ts"] < created_epoch]
-        pool = sorted(pre if pre else candidates, key=lambda x: x["ts"])
+        pre = [e for e in candidates if e["ts"] < created_epoch]
+        
+        # Strict Rule Enforcement: Discard pool entirely if no entries precede creation
+        if not pre:
+            if is_audit:
+                print(f"  [{pool_name}] Candidates total: {len(candidates)}, but 0 before epoch (< {created_epoch})")
+                for idx, c in enumerate(candidates):
+                    print(f"    - Entry {idx+1}: {c['sessionId']} | TS: {c['ts']} >= (POST) | Diff: {c['ts'] - created_epoch}ms")
+            return None
+
+        pool = sorted(pre, key=lambda x: x["ts"])
         
         if is_audit:
             print(f"  [{pool_name}] Candidates total: {len(candidates)}")
@@ -532,18 +484,14 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
             for idx, c in enumerate(candidates):
                 mark = "< (PRE)" if c["ts"] < created_epoch else ">= (POST)"
                 print(f"    - Entry {idx+1}: {c['sessionId']} | TS: {c['ts']} {mark} | Diff: {c['ts'] - created_epoch}ms")
-            fallback = " (FALLBACK APPLIED)" if not pre else ""
-            print(f"  [{pool_name}] Selected: {pool[0]['sessionId']}{fallback}")
+            print(f"  [{pool_name}] Selected: {pool[0]['sessionId']}")
             
-        return pool[0]["sessionId"] if pool else None
+        return pool[0]["sessionId"]
 
     session_id = None
 
     if reg_type in FORM_TYPES:
-        # Primary: form map, /signup path only
-        # /activate is excluded — those are post-signup email verification steps
-        if is_audit:
-            print("  Path: FORM_TYPES Logic")
+        if is_audit: print("  Path: FORM_TYPES Logic")
             
         signup_entries = [
             e for e in form_map.get(email, [])
@@ -558,19 +506,15 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
                 
         session_id = _pick_session(signup_entries, "Form Map Primary")
 
-        # Fallback: platform map
         if not session_id:
             if is_audit: print("  Falling back to Platform Map")
             session_id = _pick_session(platform_map.get(email, []), "Platform Map Fallback")
 
     else:
-        if is_audit:
-            print("  Path: NON-FORM_TYPES Logic")
+        if is_audit: print("  Path: NON-FORM_TYPES Logic")
             
-        # Primary: platform map
         session_id = _pick_session(platform_map.get(email, []), "Platform Map Primary")
 
-        # Fallback: form map, any path
         if not session_id:
             if is_audit: print("  Falling back to Form Map")
             session_id = _pick_session(form_map.get(email, []), "Form Map Fallback")
@@ -685,7 +629,8 @@ def _clean(value: Optional[str], is_journey: bool = False) -> str:
 
 def _parse_date(date_str: str) -> datetime:
     try:
-        return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        # Adjusted to default pipeline boundary mapping
+        return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=IST)
     except ValueError:
         raise ValueError(f"Invalid date '{date_str}' — use YYYY-MM-DD")
 
