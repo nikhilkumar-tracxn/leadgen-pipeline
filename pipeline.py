@@ -19,7 +19,23 @@ DATA FLOW
   Step 2  Fetch form submission logs   →  {email: [{sessionId, ts, path}]}
   Step 3  Fetch users created on target date
   Step 4  For each user, find pre-signup session ID and build journey
-  Step 5  Upload enriched records to BigQuery (WRITE_APPEND)
+  Step 5  Upload enriched records to BigQuery (atomic per-day replace)
+
+IDEMPOTENCY / NO DUPLICATES
+----------------------------
+STEP 5 no longer uses WRITE_APPEND. Instead it uses the same atomic
+per-day swap pattern as reprocess_range.py:
+
+  1. Write the new records for target_date to a temp table
+  2. CREATE OR REPLACE TABLE main AS
+       SELECT * FROM main WHERE createdDate != target_date
+       UNION ALL
+       SELECT * FROM temp_table
+  3. Drop the temp table
+
+This means re-running the pipeline for a date that was already uploaded
+(e.g. production_manual backfill of an existing date) will REPLACE that
+day's rows instead of appending duplicates. All other dates are untouched.
 
 SESSION ID RESOLUTION LOGIC
 ----------------------------
@@ -96,6 +112,7 @@ ENVIRONMENT VARIABLES
 import os
 import json
 import time
+import uuid
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -201,10 +218,14 @@ def main():
     records = step4_enrich_users(users, form_map, platform_map, target_date_api)
 
     if not records:
-        log.warning("No records to upload. Pipeline complete with 0 rows.")
+        log.warning("No records to upload. Pipeline complete with 0 rows. "
+                     "(Existing rows for this date in BigQuery, if any, are left untouched — "
+                     "0 records here is treated as 'nothing new to write', not as "
+                     "'this date should now be empty', since 0 results can also indicate "
+                     "an API issue rather than genuinely zero signups.)")
         return
 
-    step5_upload_to_bigquery(records, table)
+    step5_upload_to_bigquery(records, table, target_date_bq)
 
     log.info("=" * 60)
     log.info(f"PIPELINE COMPLETE  |  {target_date_api}  →  {table}")
@@ -473,12 +494,24 @@ def _build_user_record(user: dict, form_map: dict, platform_map: dict,
 # ════════════════════════════════════════════════════════════════════════════════
 # STEP 5 — Upload to BigQuery
 # ════════════════════════════════════════════════════════════════════════════════
-def step5_upload_to_bigquery(records: list, table: str):
+def step5_upload_to_bigquery(records: list, table: str, target_date_bq: str):
     """
-    Uploads enriched records to BigQuery using WRITE_APPEND.
-    Uses NDJSON format with explicit schema to prevent type mismatches.
+    Uploads enriched records to BigQuery using an atomic per-day replace.
+
+    Steps:
+      1. Load the new records into a temp table (explicit schema, WRITE_TRUNCATE).
+      2. CREATE OR REPLACE TABLE main AS
+           SELECT * FROM main WHERE createdDate != target_date_bq
+           UNION ALL
+           SELECT * FROM temp_table
+      3. Drop the temp table.
+
+    This makes the pipeline safe to re-run for the same date — any existing
+    rows for target_date_bq are removed before the new rows are written, so
+    no duplicates are ever created. All other dates are left untouched.
     """
-    log.info(f"STEP 5: Uploading {len(records)} rows → {PROJECT_ID}.{DATASET}.{table}")
+    log.info(f"STEP 5: Uploading {len(records)} rows for {target_date_bq} "
+             f"→ {PROJECT_ID}.{DATASET}.{table}  (atomic per-day replace)")
 
     creds = service_account.Credentials.from_service_account_info(
         json.loads(GCP_SA_JSON),
@@ -502,15 +535,37 @@ def step5_upload_to_bigquery(records: list, table: str):
         bigquery.SchemaField("userStatus",        "STRING", mode="NULLABLE"),
     ]
 
-    job_config = bigquery.LoadJobConfig(
-        schema=schema,
-        write_disposition="WRITE_APPEND",
-        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-    )
+    temp_id = f"{PROJECT_ID}.{DATASET}.temp_pipeline_{uuid.uuid4().hex[:8]}"
 
-    job = client.load_table_from_json(records, table_ref, job_config=job_config)
-    job.result()
-    log.info(f"  ✓ {len(records)} rows uploaded successfully")
+    try:
+        job_config = bigquery.LoadJobConfig(
+            schema=schema,
+            write_disposition="WRITE_TRUNCATE",
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        )
+        client.load_table_from_json(records, temp_id, job_config=job_config).result()
+
+        sql = f"""
+            CREATE OR REPLACE TABLE `{table_ref}`
+            CLUSTER BY registrationType, geography
+            AS
+            SELECT * FROM `{table_ref}`
+            WHERE createdDate != DATE('{target_date_bq}')
+
+            UNION ALL
+
+            SELECT * FROM `{temp_id}`
+        """
+        client.query(sql).result()
+
+    finally:
+        try:
+            client.delete_table(temp_id, not_found_ok=True)
+        except Exception:
+            pass
+
+    log.info(f"  ✓ {len(records)} rows for {target_date_bq} written "
+             f"(existing rows for that date, if any, were replaced)")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
