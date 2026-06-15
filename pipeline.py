@@ -51,6 +51,13 @@ How it works:
 
   5.  If no candidates exist at all → session_id = None → stored as N/A.
 
+USER STATUS
+-----------
+The Tracxn /user API response includes a top-level "status" field for each
+user (e.g. their current account/lead status). This is captured directly from
+the Step 3 user fetch — no extra API call is required — and stored in the new
+`userStatus` column. If absent, stored as "N/A".
+
 LOG WINDOW
 ----------
   log_start = target_date - 3 days
@@ -345,6 +352,9 @@ def _build_user_record(user: dict, form_map: dict, platform_map: dict,
             if c.get("userCategory")]
     user_category = ", ".join(cats) if cats else (user.get("userCategory") or "N/A")
 
+    # User status (from the /user API response, no extra call required)
+    user_status = user.get("status") or "N/A"
+
     cd = user.get("createdDate") or {}
     created_date = "{}-{:02d}-{:02d}".format(
         int(cd.get("year")  or 2025),
@@ -456,6 +466,7 @@ def _build_user_record(user: dict, form_map: dict, platform_map: dict,
         "sessionId":        clean(session_id or "N/A"),
         "userJourney":      clean(journey, is_journey=True),
         "cta":              f"Auto_{target_date}",
+        "userStatus":       clean(user_status),
     }
 
 
@@ -488,6 +499,7 @@ def step5_upload_to_bigquery(records: list, table: str):
         bigquery.SchemaField("sessionId",         "STRING", mode="NULLABLE"),
         bigquery.SchemaField("userJourney",       "STRING", mode="NULLABLE"),
         bigquery.SchemaField("cta",               "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("userStatus",        "STRING", mode="NULLABLE"),
     ]
 
     job_config = bigquery.LoadJobConfig(
