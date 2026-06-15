@@ -1,21 +1,23 @@
 """
 ================================================================================
-User Category Sync Pipeline
+User Category & Status Sync Pipeline
 ================================================================================
 
 PURPOSE
 -------
 User categories on the Tracxn platform are not static — they get updated over
-time as users interact with the product and are reclassified. This script
-re-fetches the latest category from the Tracxn API for a date range of users
-already in BigQuery and updates the `userCategory` column in-place.
+time as users interact with the product and are reclassified. Similarly, a
+user's `userStatus` (account/lead status) can change after signup. This script
+re-fetches the latest category AND status from the Tracxn API for a date range
+of users already in BigQuery and updates the `userCategory` and `userStatus`
+columns in-place.
 
 It is designed to run in two automatic patterns:
 
   Weekly sync  — runs on 7th, 14th, 21st, 28th of every month
                  Updates users created in the last 7 days
-                 (catches recent signups whose category was not yet assigned
-                  at the time of the daily pipeline run)
+                 (catches recent signups whose category/status was not yet
+                  assigned at the time of the daily pipeline run)
 
   Monthly sync — runs on 1st of every month
                  Updates all users created in the previous calendar month
@@ -31,8 +33,9 @@ does — DML UPDATE statements on large tables are slow and costly. Instead, the
 script uses the "swap" pattern, which is more efficient and atomic:
 
   1. Read the rows in the target date range from BigQuery into memory
-  2. For each user in that range, fetch their latest category from Tracxn API
-  3. Apply the updated categories to the in-memory dataframe
+  2. For each user in that range, fetch their latest category AND status from
+     the Tracxn API (single call per batch returns both fields)
+  3. Apply the updated categories and statuses to the in-memory dataframe
   4. Write the updated rows to a temporary BigQuery table
   5. Reconstruct the full table using CREATE OR REPLACE TABLE:
        rows BEFORE the range  (unchanged, read from existing table)
@@ -42,6 +45,11 @@ script uses the "swap" pattern, which is more efficient and atomic:
 
 This ensures all other dates are completely untouched and the operation is
 atomic — the table is either fully updated or not updated at all.
+
+The temp table is written with autodetect=True from a pandas DataFrame that
+already carries the full schema of the source table (including `userStatus`,
+since it was read via `SELECT *`), so all columns — including any added in
+the future — pass through correctly as long as they exist in the source table.
 
 RUN MODES
 ---------
@@ -73,7 +81,9 @@ AUTHOR / HISTORY
 ----------------
 Based on a one-off Google Colab script that was run manually to sync May 2026
 categories. Converted to a scheduled GitHub Actions pipeline for fully
-automatic recurring syncs.
+automatic recurring syncs. Extended to also refresh `userStatus` after the
+`userStatus` column was added to the BigQuery table and backfilled via a
+one-off Colab script.
 ================================================================================
 """
 
@@ -127,7 +137,7 @@ MAX_RETRIES = 3     # Retry attempts per failed API request
 # ════════════════════════════════════════════════════════════════════════════════
 def main():
     log.info("=" * 60)
-    log.info(f"CATEGORY SYNC PIPELINE  |  mode={SYNC_MODE.upper()}")
+    log.info(f"CATEGORY & STATUS SYNC PIPELINE  |  mode={SYNC_MODE.upper()}")
     log.info("=" * 60)
 
     # ── Resolve date range and target table from SYNC_MODE ───────────────────
@@ -185,24 +195,33 @@ def main():
 
     log.info(f"  → {len(range_df):,} users loaded")
 
-    # ── Step 2: Fetch latest categories from Tracxn API ──────────────────────
-    log.info(f"STEP 2: Fetching latest categories from Tracxn API...")
-    id_to_category = _fetch_categories_from_api(range_df["id"].tolist())
+    # ── Step 2: Fetch latest categories + statuses from Tracxn API ────────────
+    log.info(f"STEP 2: Fetching latest categories and statuses from Tracxn API...")
+    id_to_category, id_to_status = _fetch_categories_and_status_from_api(range_df["id"].tolist())
     log.info(f"  → Categories fetched for {len(id_to_category):,} users")
+    log.info(f"  → Statuses fetched for {len(id_to_status):,} users")
 
     failed_count = len(range_df) - len(id_to_category)
     if failed_count > 0:
-        log.warning(f"  → {failed_count} users had API fetch failures — their categories are unchanged")
+        log.warning(f"  → {failed_count} users had API fetch failures — "
+                     f"their categories and statuses are unchanged")
 
-    # ── Step 3: Apply updated categories ─────────────────────────────────────
-    log.info("STEP 3: Applying updated categories...")
+    # ── Step 3: Apply updated categories and statuses ─────────────────────────
+    log.info("STEP 3: Applying updated categories and statuses...")
     range_df["id_str"] = range_df["id"].astype(str)
-    updated_mask = range_df["id_str"].isin(id_to_category)
-    range_df.loc[updated_mask, "userCategory"] = range_df.loc[updated_mask, "id_str"].map(id_to_category)
+
+    cat_mask = range_df["id_str"].isin(id_to_category)
+    range_df.loc[cat_mask, "userCategory"] = range_df.loc[cat_mask, "id_str"].map(id_to_category)
+
+    status_mask = range_df["id_str"].isin(id_to_status)
+    range_df.loc[status_mask, "userStatus"] = range_df.loc[status_mask, "id_str"].map(id_to_status)
+
     range_df = range_df.drop(columns=["id_str"])
 
-    actually_changed = updated_mask.sum()
-    log.info(f"  → {actually_changed:,} user categories updated in memory")
+    categories_changed = cat_mask.sum()
+    statuses_changed   = status_mask.sum()
+    log.info(f"  → {categories_changed:,} user categories updated in memory")
+    log.info(f"  → {statuses_changed:,} user statuses updated in memory")
 
     # ── Step 4: Write updated range to temp table ─────────────────────────────
     temp_table_id = f"{PROJECT_ID}.{DATASET}.temp_catsync_{uuid.uuid4().hex[:8]}"
@@ -222,10 +241,11 @@ def main():
 
     # ── Summary ───────────────────────────────────────────────────────────────
     log.info("=" * 60)
-    log.info("CATEGORY SYNC COMPLETE")
+    log.info("CATEGORY & STATUS SYNC COMPLETE")
     log.info(f"  Date range    : {start_str} → {end_str}")
     log.info(f"  Users in range: {len(range_df):,}")
-    log.info(f"  Categories updated: {actually_changed:,}")
+    log.info(f"  Categories updated: {categories_changed:,}")
+    log.info(f"  Statuses updated  : {statuses_changed:,}")
     log.info(f"  API failures  : {failed_count}")
     log.info(f"  Table         : {table_ref}")
     log.info("=" * 60)
@@ -239,7 +259,7 @@ def _load_range_from_bq(client: bigquery.Client, table_ref: str,
                          start_str: str, end_str: str) -> pd.DataFrame:
     """
     Loads all rows from BigQuery where createdDate is in [start_str, end_str].
-    Returns a pandas DataFrame with all columns intact.
+    Returns a pandas DataFrame with all columns intact (including userStatus).
     """
     query = f"""
         SELECT *
@@ -250,21 +270,27 @@ def _load_range_from_bq(client: bigquery.Client, table_ref: str,
     return client.query(query).to_dataframe()
 
 
-def _fetch_categories_from_api(user_ids: list) -> dict:
+def _fetch_categories_and_status_from_api(user_ids: list) -> Tuple[dict, dict]:
     """
-    Fetches the latest userCategory for a list of user IDs from the Tracxn API.
+    Fetches the latest userCategory AND userStatus for a list of user IDs from
+    the Tracxn API.
 
-    Uses ID-based filtering in batches of BATCH_SIZE. For each user, extracts
-    all entries in categoryList[].userCategory and joins them with ", ".
-    Falls back to "Not yet classified" if the list is empty.
+    Uses ID-based filtering in batches of BATCH_SIZE. For each user:
+      - userCategory: extracts all entries in categoryList[].userCategory and
+        joins them with ", ". Falls back to "Not yet classified" if empty.
+      - userStatus: extracted from the top-level "status" field. Falls back to
+        "N/A" if absent.
+
+    Both fields come from the same API response — no extra API calls needed.
 
     Returns:
-      dict {str(user_id): category_string}
+      (id_to_category, id_to_status) — two dicts {str(user_id): value}.
       Only contains entries for users that were successfully fetched.
-      Users with API failures are absent from the dict (their rows are left
+      Users with API failures are absent from both dicts (their rows are left
       unchanged in the downstream apply step).
     """
     id_to_category = {}
+    id_to_status   = {}
     total_batches = (len(user_ids) + BATCH_SIZE - 1) // BATCH_SIZE
 
     for batch_num, i in enumerate(range(0, len(user_ids), BATCH_SIZE), start=1):
@@ -285,6 +311,7 @@ def _fetch_categories_from_api(user_ids: list) -> dict:
 
         for user in users:
             uid = str(user.get("id", ""))
+
             cats = [
                 c["userCategory"]
                 for c in user.get("categoryList", [])
@@ -292,9 +319,11 @@ def _fetch_categories_from_api(user_ids: list) -> dict:
             ]
             id_to_category[uid] = ", ".join(cats) if cats else "Not yet classified"
 
+            id_to_status[uid] = user.get("status") or "N/A"
+
         time.sleep(SLEEP_S)
 
-    return id_to_category
+    return id_to_category, id_to_status
 
 
 def _write_df_to_bq(client: bigquery.Client, df: pd.DataFrame, temp_table_id: str):
@@ -317,7 +346,7 @@ def _atomic_swap(client: bigquery.Client, table_ref: str,
     """
     Reconstructs the full table by unioning:
       - Rows before the sync range (from the existing table — untouched)
-      - Rows in the sync range  (from the temp table — updated categories)
+      - Rows in the sync range  (from the temp table — updated categories/statuses)
       - Rows after the sync range (from the existing table — untouched)
 
     Uses CREATE OR REPLACE TABLE so the operation is atomic. The table is
@@ -337,7 +366,7 @@ def _atomic_swap(client: bigquery.Client, table_ref: str,
 
         UNION ALL
 
-        -- Rows IN the sync range — with refreshed categories from temp table
+        -- Rows IN the sync range — with refreshed categories/statuses from temp table
         SELECT * FROM `{temp_table_id}`
 
         UNION ALL
