@@ -41,6 +41,13 @@ FIX 4 — Earliest session ID before signup
   earliest timestamp that occurred before the user's createdDate.
   Falls back to earliest overall only if nothing exists before createdDate.
 
+USER STATUS
+-----------
+The Tracxn /user API response includes a top-level "status" field for each
+user. This is captured directly from the user fetch (no extra API call) and
+stored in the `userStatus` column, preserved through the per-day atomic
+replace / insert just like every other column.
+
 SAFETY
 ------
 - Only touches rows for the specific day being processed
@@ -334,6 +341,7 @@ def _atomic_replace_day(bq, table_ref: str, records: list, date_str: str):
         bigquery.SchemaField("sessionId",         "STRING", mode="NULLABLE"),
         bigquery.SchemaField("userJourney",       "STRING", mode="NULLABLE"),
         bigquery.SchemaField("cta",               "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("userStatus",        "STRING", mode="NULLABLE"),
     ]
 
     try:
@@ -380,6 +388,7 @@ def _insert_day(bq, table_ref: str, records: list):
         bigquery.SchemaField("sessionId",         "STRING", mode="NULLABLE"),
         bigquery.SchemaField("userJourney",       "STRING", mode="NULLABLE"),
         bigquery.SchemaField("cta",               "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("userStatus",        "STRING", mode="NULLABLE"),
     ]
     job_config = bigquery.LoadJobConfig(
         schema=schema,
@@ -461,6 +470,9 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
 
     cats = [c.get("userCategory") for c in (user.get("categoryList") or []) if c.get("userCategory")]
     user_category = ", ".join(cats) if cats else (user.get("userCategory") or "N/A")
+
+    # User status (from the /user API response, no extra call required)
+    user_status = user.get("status") or "N/A"
 
     cd = user.get("createdDate") or {}
     created_date = "{}-{:02d}-{:02d}".format(
@@ -581,6 +593,7 @@ def _build_record(user: dict, form_map: dict, platform_map: dict, target_date: s
         "sessionId":        _clean(session_id or "N/A"),
         "userJourney":      _clean(journey, is_journey=True),
         "cta":              f"Auto_{target_date}",
+        "userStatus":       _clean(user_status),
     }
 
 
