@@ -170,10 +170,6 @@ Rather than running slow DML UPDATEs, the sync uses a more efficient approach:
 ```
 The operation is atomic. All data outside the date range is untouched.
 
-### Two tokens
-
-The category sync uses a **different token** (`TRACXN_SYNC_TOKEN`) from the daily ingest. The `/user` endpoint with ID-based filtering requires a UUID-format token (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`), while date-filter endpoints use the long alphanumeric token (`TRACXN_ACCESS_TOKEN`). Both must be set as GitHub Secrets.
-
 ### Run Modes
 
 | Mode | Date range | Table | Use case |
@@ -372,7 +368,6 @@ No credit card required — this is just IAM.
 | Secret | Value |
 |---|---|
 | `TRACXN_ACCESS_TOKEN` | Long alphanumeric token — used by daily ingest and reprocess |
-| `TRACXN_SYNC_TOKEN` | UUID-format token (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) — used by category sync only |
 | `GCP_PROJECT_ID` | `leadgen-474708` |
 | `GCP_SA_KEY` | Full contents of the downloaded JSON service account key file |
 
@@ -433,7 +428,6 @@ Pagination: `size` (page size, max 30) + `from` (offset). Empty `result` array =
 | Variable | Where | Used by | Description |
 |---|---|---|---|
 | `TRACXN_ACCESS_TOKEN` | GitHub Secret | Daily ingest, Reprocess | Long alphanumeric Tracxn API token |
-| `TRACXN_SYNC_TOKEN` | GitHub Secret | Category sync | UUID-format Tracxn token for ID-filter calls |
 | `GCP_PROJECT_ID` | GitHub Secret | All | GCP project ID |
 | `GCP_SA_KEY` | GitHub Secret | All | Full GCP service account key JSON |
 | `BQ_DATASET` | GitHub Variable | All | BigQuery dataset name |
@@ -460,9 +454,6 @@ The most common cause is that `created_epoch` is computed incorrectly. When `epo
 
 **`UNION ALL has incompatible types: DATE, STRING`**
 Caused by writing the temp table with `autodetect=True` which infers `createdDate` as STRING. The reprocess pipeline uses explicit schema with `createdDate` as `DATE`. Ensure you are running the latest `reprocess_range.py`.
-
-**HTTP 403 from category sync**
-The category sync uses `TRACXN_SYNC_TOKEN` (UUID-format), not `TRACXN_ACCESS_TOKEN`. Verify `TRACXN_SYNC_TOKEN` is set correctly in GitHub Secrets.
 
 **Scheduled run at 6 AM IST did not fire**
 GitHub pauses scheduled workflows after 60 days of repo inactivity. Go to Actions tab → Enable Workflows if shown. Also check if the run was just delayed — GitHub can delay scheduled runs by up to 15 minutes under load. If the run was missed entirely, use `production_manual` mode to backfill.
